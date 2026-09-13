@@ -1,0 +1,10 @@
+.git
+.agents
+.codex
+.vs
+**/bin
+**/obj
+artifacts
+*.gif
+*.user
+*.suo
