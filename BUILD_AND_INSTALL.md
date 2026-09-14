@@ -80,7 +80,9 @@ docker buildx build --progress=plain --output type=local,dest=./artifacts .
 
 ## Автоматические релизы GitHub
 
-Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) запускается на каждый `push`. Он поднимает Docker Buildx, выполняет сборку тем же Dockerfile и публикует `FormulaNavigator64.xll` как asset GitHub Release. Тег и название релиза имеют вид `build-<полный SHA коммита>`, поэтому бинарь всегда можно сопоставить с точной версией исходников. Создание release и загрузка бинаря отдельно повторяются до трёх раз при временных ошибках GitHub API; повторный запуск также переиспользует уже созданный релиз. Если Docker-сборка, тесты или проверка XLL завершаются ошибкой, release не создаётся.
+Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) запускается только на `push` в ветку `main`: после слияния PR или прямой отправки коммитов в `main`. Push в другие ветки, создание или обновление PR и отправка тегов его не запускают. Ограничение задано через `on.push.branches: [main]`; [описание фильтров GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushbranchestagsbranches-ignoretags-ignore).
+
+Workflow поднимает Docker Buildx, выполняет сборку тем же Dockerfile и публикует `FormulaNavigator64.xll` как asset GitHub Release. Тег и название релиза имеют вид `build-<полный SHA коммита>`, поэтому бинарь всегда можно сопоставить с точной версией исходников. Создание release и загрузка бинаря отдельно повторяются до трёх раз при временных ошибках GitHub API; повторный запуск также переиспользует уже созданный релиз. Если Docker-сборка, тесты или проверка XLL завершаются ошибкой, release не создаётся.
 
 Внутри образа последовательно выполняются:
 

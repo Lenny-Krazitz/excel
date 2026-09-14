@@ -2,6 +2,8 @@ name: Build and release add-in
 
 on:
   push:
+    branches:
+      - main
 
 permissions:
   contents: write

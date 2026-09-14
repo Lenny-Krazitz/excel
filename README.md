@@ -17,7 +17,7 @@ bash tools/build-in-docker.sh
 
 Скрипт использует Buildx, если он установлен, иначе — обычный `docker build` и `docker cp`. После успешной сборки готовый файл появится в `artifacts/FormulaNavigator64.xll`.
 
-Каждый `push` в GitHub запускает ту же Docker-сборку и публикует `FormulaNavigator64.xll` в отдельном GitHub Release с тегом `build-<SHA коммита>`. Публикация повторяет временные ошибки GitHub API до трёх раз.
+Каждый `push` в ветку `main` (включая слияние PR) запускает ту же Docker-сборку и публикует `FormulaNavigator64.xll` в отдельном GitHub Release с тегом `build-<SHA коммита>`. Push в другие ветки и теги релиз не запускает. Публикация повторяет временные ошибки GitHub API до трёх раз.
 
 Подробные требования, подключение, проверки и ограничения: **[BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md)**.
 
