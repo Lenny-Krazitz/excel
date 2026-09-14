@@ -25,7 +25,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: build-${{ github.sha }}
         run: |
-          gh release create "$TAG" artifacts/FormulaNavigator64.xll \
-            --target "$GITHUB_SHA" \
-            --title "Formula Navigator $TAG" \
-            --notes "Automated Docker build for commit $GITHUB_SHA."
+          for attempt in 1 2 3; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              break
+            fi
+            if gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Formula Navigator $TAG" \
+              --notes "Automated Docker build for commit $GITHUB_SHA."; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "Could not create release $TAG after $attempt attempts." >&2
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+
+          for attempt in 1 2 3; do
+            if gh release upload "$TAG" artifacts/FormulaNavigator64.xll --clobber; then
+              exit 0
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "Could not upload FormulaNavigator64.xll after $attempt attempts." >&2
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
