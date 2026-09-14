@@ -1166,9 +1166,11 @@ namespace FormulaNavigator.AddIn.Excel
                 string note;
                 if (node.Kind == FormulaNodeKind.Reference)
                 {
-                    if (_gateway.TryResolveReference(context, sheet, node.Text, false, out resolution, out note))
-                        matched = _sourceArea.Intersects(resolution.Area);
-                    else Warn(note);
+                    // A1 references are already fully represented by the parser.  Resolving every
+                    // one through Worksheet.Range causes several COM round trips per formula and
+                    // makes large-workbook scans unnecessarily slow.  The scan only needs the
+                    // reference area, not a COM Range, so compare the parsed area directly.
+                    if (!TryMatchDirectReference(context, node.Text, out matched, out note)) Warn(note);
                     return true;
                 }
                 if (node.Kind == FormulaNodeKind.Name)
@@ -1222,6 +1224,25 @@ namespace FormulaNavigator.AddIn.Excel
                         if (childMatch) { matched = true; return true; }
                     }
                 }
+                return true;
+            }
+
+            private bool TryMatchDirectReference(InspectionContext context, string text, out bool matched, out string note)
+            {
+                matched = false;
+                note = String.Empty;
+                ReferenceArea area;
+                if (!ReferenceParser.TryParse(text, context.Location.Workbook, context.Location.Sheet, out area))
+                {
+                    note = "This reference form is not supported.";
+                    return false;
+                }
+                if (!String.Equals(area.Workbook, context.Location.Workbook, StringComparison.OrdinalIgnoreCase))
+                {
+                    note = "This reference points to an external or closed workbook and was not resolved.";
+                    return false;
+                }
+                matched = _sourceArea.Intersects(area);
                 return true;
             }
 
