@@ -17,6 +17,8 @@ bash tools/build-in-docker.sh
 
 Скрипт использует Buildx, если он установлен, иначе — обычный `docker build` и `docker cp`. После успешной сборки готовый файл появится в `artifacts/FormulaNavigator64.xll`.
 
+Каждый `push` в GitHub запускает ту же Docker-сборку и публикует `FormulaNavigator64.xll` в отдельном GitHub Release с тегом `build-<SHA коммита>`.
+
 Подробные требования, подключение, проверки и ограничения: **[BUILD_AND_INSTALL.md](BUILD_AND_INSTALL.md)**.
 
 Версия 1.0.4: дерево со ссылками на листьях, ширина окон уменьшена вдвое, размещение у правого края Excel. Docker-сборка запускает 13 групп C#-тестов, собирает надстройку и проверяет формат x64 и экспорт `xlAutoOpen`. Работа окон и фокуса требует проверки в Windows Excel. Инструменты .NET используются внутри Docker.

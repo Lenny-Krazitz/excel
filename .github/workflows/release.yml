@@ -1,0 +1,31 @@
+name: Build and release add-in
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Docker artifact and create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and export release artifact
+        run: docker buildx build --progress=plain --output type=local,dest=artifacts .
+
+      - name: Publish commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.sha }}
+        run: |
+          gh release create "$TAG" artifacts/FormulaNavigator64.xll \
+            --target "$GITHUB_SHA" \
+            --title "Formula Navigator $TAG" \
+            --notes "Automated Docker build for commit $GITHUB_SHA."
