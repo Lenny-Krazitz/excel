@@ -81,7 +81,7 @@ namespace FormulaNavigator.AddIn.UI
             try
             {
                 var progress = new Progress<string>(text => { if (!closing) StatusLabel.Text = text; });
-                DependencyResult result;
+                DependencyResult result = null;
                 bool fromCache = !forceRefresh && ResultCache.TryGetValue(origin.Location.Key, out result);
                 if (fromCache)
                     progress.Report("Использую сохранённый результат…");
