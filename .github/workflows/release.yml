@@ -1,6 +1,9 @@
 name: Build and release add-in
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -23,6 +26,7 @@ jobs:
         run: docker buildx build --progress=plain --output type=local,dest=artifacts .
 
       - name: Publish commit release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v0.0.${{ github.run_number }}

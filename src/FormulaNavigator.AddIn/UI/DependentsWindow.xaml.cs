@@ -25,6 +25,11 @@ namespace FormulaNavigator.AddIn.UI
 
     public partial class DependentsWindow : Window
     {
+        private const int MaxCachedResults = 16;
+        private static readonly Dictionary<string, DependencyResult> ResultCache =
+            new Dictionary<string, DependencyResult>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Queue<string> ResultCacheOrder = new Queue<string>();
+
         private readonly ExcelGateway gateway;
         private readonly InspectionContext origin;
         private readonly Action<ExcelLocation> explore;
@@ -58,10 +63,10 @@ namespace FormulaNavigator.AddIn.UI
             returnToOrigin = false;
             Close();
         }
-        private async void Window_Loaded(object sender, RoutedEventArgs args) { await RefreshResults(); }
-        private async void Refresh_Click(object sender, RoutedEventArgs args) { await RefreshResults(); }
+        private async void Window_Loaded(object sender, RoutedEventArgs args) { await RefreshResults(false); }
+        private async void Refresh_Click(object sender, RoutedEventArgs args) { await RefreshResults(true); }
 
-        private async Task RefreshResults()
+        private async Task RefreshResults(bool forceRefresh)
         {
             if (search != null || closing) return;
             var cancellation = new CancellationTokenSource();
@@ -76,11 +81,21 @@ namespace FormulaNavigator.AddIn.UI
             try
             {
                 var progress = new Progress<string>(text => { if (!closing) StatusLabel.Text = text; });
-                var result = await gateway.FindDependentsAsync(origin.Location, cancellation.Token, progress);
+                DependencyResult result;
+                bool fromCache = !forceRefresh && ResultCache.TryGetValue(origin.Location.Key, out result);
+                if (fromCache)
+                    progress.Report("Использую сохранённый результат…");
+                else
+                {
+                    result = await gateway.FindDependentsAsync(origin.Location, cancellation.Token, progress);
+                    CacheResult(origin.Location.Key, result);
+                }
                 if (closing) return;
                 cells.AddRange(result.Cells);
                 ApplyFilter();
-                StatusLabel.Text = "Найдено ячеек: " + cells.Count + ". Проверено формул: " + result.FormulaCount + ". После изменения книги нажмите «Обновить».";
+                StatusLabel.Text = "Найдено ячеек: " + cells.Count + ". Проверено формул: " + result.FormulaCount
+                    + (fromCache ? ". Результат взят из кэша." : ".")
+                    + " После изменения книги нажмите «Обновить».";
                 if (result.Warnings.Count != 0)
                 {
                     WarningsBox.Text = string.Join(Environment.NewLine, result.Warnings);
@@ -106,6 +121,19 @@ namespace FormulaNavigator.AddIn.UI
                     SearchProgress.Visibility = Visibility.Collapsed;
                 }
             }
+        }
+
+        private static void CacheResult(string key, DependencyResult result)
+        {
+            if (ResultCache.ContainsKey(key))
+            {
+                ResultCache[key] = result;
+                return;
+            }
+            while (ResultCache.Count >= MaxCachedResults && ResultCacheOrder.Count != 0)
+                ResultCache.Remove(ResultCacheOrder.Dequeue());
+            ResultCache[key] = result;
+            ResultCacheOrder.Enqueue(key);
         }
 
         private void ApplyFilter()
