@@ -84,7 +84,7 @@ namespace FormulaNavigator.AddIn.UI
                 DependencyResult result = null;
                 bool fromCache = !forceRefresh && ResultCache.TryGetValue(origin.Location.Key, out result);
                 if (fromCache)
-                    progress.Report("Использую сохранённый результат…");
+                    StatusLabel.Text = "Использую сохранённый результат…";
                 else
                 {
                     result = await gateway.FindDependentsAsync(origin.Location, cancellation.Token, progress);
