@@ -50,6 +50,7 @@ namespace FormulaNavigator.AddIn
                 RestoreKeys();
                 explorer = null;
                 dependents = null;
+                if (gateway != null) gateway.Dispose();
                 gateway = null;
                 application = null;
             }
@@ -105,6 +106,7 @@ namespace FormulaNavigator.AddIn
                     + "\n\nДоступ к Excel: " + (gateway != null && !shuttingDown ? "готов" : "не инициализирован")
                     + "\nПоследняя регистрация клавиш: " + (keysRegistered ? "выполнена" : "не выполнена");
                 if (!String.IsNullOrEmpty(initializationError)) status += "\n\nОшибка инициализации: " + initializationError;
+                if (gateway != null && !shuttingDown) status += "\nИндексация книг: " + gateway.IndexingStatus;
                 MessageBox.Show(status, MenuName, MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception error) { Report(error); }
@@ -134,6 +136,7 @@ namespace FormulaNavigator.AddIn
         {
             if (application == null) application = ExcelDnaUtil.Application;
             if (gateway == null) gateway = new ExcelGateway(application);
+            gateway.StartIndexing();
         }
 
         private static void RegisterKeys()

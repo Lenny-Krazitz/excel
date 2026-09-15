@@ -139,6 +139,15 @@ namespace FormulaNavigator.Core
                 if (Char.IsLetter(c) || c == '_' || c == '\\')
                 {
                     while (_position < _source.Length && IsNameCharacter(_source[_position])) _position++;
+                    if (_position < _source.Length && _source[_position] == '$')
+                    {
+                        _position++;
+                        while (_position < _source.Length && Char.IsDigit(_source[_position])) _position++;
+                        string referenceText = _source.Substring(start, _position - start);
+                        ReferenceArea mixedReference;
+                        return New(ReferenceParser.TryParse(referenceText, null, null, out mixedReference)
+                            ? TokenKind.Reference : TokenKind.Unknown, start, _position - start, whitespace);
+                    }
                     if (_position < _source.Length && _source[_position] == '!')
                     {
                         _position++;
@@ -521,8 +530,11 @@ namespace FormulaNavigator.Core
 
             private static bool IsReferenceExpression(FormulaNode node)
             {
-                return node != null && (node.Kind == FormulaNodeKind.Reference
-                    || (node.Kind == FormulaNodeKind.Binary && (node.Operator == ":" || node.Operator == " " || node.Operator == ",")));
+                if (node == null) return false;
+                if (node.Kind == FormulaNodeKind.Group && node.Children.Count == 1)
+                    return IsReferenceExpression(node.Children[0]);
+                return node.Kind == FormulaNodeKind.Reference ||
+                    node.Kind == FormulaNodeKind.Binary && (node.Operator == ":" || node.Operator == " " || node.Operator == ",");
             }
 
             private FormulaNode CoerceRowReference(FormulaNode node)

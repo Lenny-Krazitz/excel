@@ -73,15 +73,20 @@ namespace FormulaNavigator.AddIn.Excel
 
     public sealed class DependencyResult
     {
-        public DependencyResult(IReadOnlyList<DependentCell> cells, IReadOnlyList<string> warnings, int formulaCount)
+        public DependencyResult(IReadOnlyList<DependentCell> cells, IReadOnlyList<string> warnings, int formulaCount,
+            bool indexReused = false, long elapsedMilliseconds = 0)
         {
             Cells = cells ?? new List<DependentCell>().AsReadOnly();
             Warnings = warnings ?? new List<string>().AsReadOnly();
             FormulaCount = formulaCount;
+            IndexReused = indexReused;
+            ElapsedMilliseconds = elapsedMilliseconds;
         }
 
         public IReadOnlyList<DependentCell> Cells { get; private set; }
         public IReadOnlyList<string> Warnings { get; private set; }
         public int FormulaCount { get; private set; }
+        public bool IndexReused { get; private set; }
+        public long ElapsedMilliseconds { get; private set; }
     }
 }

@@ -19,6 +19,8 @@ RUN dotnet run --project tests/FormulaNavigator.Core.Tests/FormulaNavigator.Core
 RUN dotnet build src/FormulaNavigator.AddIn/FormulaNavigator.AddIn.csproj --configuration Release --no-restore
 RUN dotnet run --project tests/FormulaNavigator.Core.Tests/FormulaNavigator.Core.Tests.csproj --configuration Release --no-build -- \
     --verify-xll /src/src/FormulaNavigator.AddIn/bin/Release/net48/publish/FormulaNavigator64.xll
+RUN dotnet run --project tests/FormulaNavigator.Core.Tests/FormulaNavigator.Core.Tests.csproj --configuration Release --no-build -- \
+    --verify-addin /src/src/FormulaNavigator.AddIn/bin/Release/net48/FormulaNavigator.AddIn.dll
 
 # Build and export with: bash tools/build-in-docker.sh (Buildx is optional).
 # With Buildx: docker buildx build --output type=local,dest=./artifacts .
