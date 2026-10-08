@@ -12,13 +12,15 @@ namespace FormulaNavigator.Core.Tests
         private static int Main(string[] args)
         {
             if (args.Length == 2 && args[0] == "--verify-xll") return VerifyXll(args[1]);
+            if (args.Length == 2 && args[0] == "--verify-addin") return ManagedAddInVerifier.Verify(args[1]);
             if (args.Length != 0)
             {
-                Console.Error.WriteLine("Usage: FormulaNavigator.Core.Tests [--verify-xll path]");
+                Console.Error.WriteLine("Usage: FormulaNavigator.Core.Tests [--verify-xll path | --verify-addin path]");
                 return 2;
             }
             Run("spans and nested functions", SpansAndNestedFunctions);
             Run("quoted and cross-sheet references", QuotedReferences);
+            Run("mixed absolute reference lexing", MixedAbsoluteReferenceLexing);
             Run("repeated expressions", RepeatedExpressions);
             Run("strings and scientific literals", StringAndNumericLiterals);
             Run("missing arguments and arrays", MissingArgumentsAndArrays);
@@ -30,6 +32,12 @@ namespace FormulaNavigator.Core.Tests
             Run("navigation tree cell leaves", NavigationCellLeaves);
             Run("navigation tree ranges and spans", NavigationRangesAndSpans);
             Run("navigation tree calculated references", NavigationCalculatedReferences);
+            Run("dependency plan static ranges and intersections", DependencyPlanStaticRangesAndIntersections);
+            Run("dependency plan static OFFSET", DependencyPlanStaticOffset);
+            Run("dependency plan dynamic nodes and external references", DependencyPlanDynamicAndExternalReferences);
+            Run("dependency plan intersection resolution cap", DependencyPlanIntersectionResolutionCap);
+            Run("dependency range index", DependencyRangeIndexTests);
+            Run("formula read block coverage", FormulaReadBlockCoverage);
             Console.WriteLine(_failures == 0 ? "All FormulaNavigator.Core tests passed." : _failures + " test(s) failed.");
             return _failures == 0 ? 0 : 1;
         }
@@ -99,6 +107,24 @@ namespace FormulaNavigator.Core.Tests
             AssertEqual("A1+A1", first.Text, "first repeated expression text");
             AssertEqual("A1+A1", second.Text, "second repeated expression text");
             Assert(first.Start != second.Start, "repeated expressions retain their individual spans");
+        }
+
+        private static void MixedAbsoluteReferenceLexing()
+        {
+            const string formula = "=SUM(I140,$I140,I$140,$I$140,'Sheet 1'!I$140,Sheet2!$I140,Income)";
+            FormulaParseResult result = FormulaParser.Parse(formula);
+            Assert(result.Success, Diagnostics(result));
+            AssertEqual(7, result.Root.Children.Count, "mixed absolute reference argument count");
+            for (int i = 0; i < 6; i++) AssertEqual(FormulaNodeKind.Reference, result.Root.Children[i].Kind,
+                "reference form " + i + " remains one reference token");
+            AssertEqual("I140", result.Root.Children[0].Text, "plain reference span");
+            AssertEqual("$I140", result.Root.Children[1].Text, "absolute column reference span");
+            AssertEqual("I$140", result.Root.Children[2].Text, "absolute row reference span");
+            AssertEqual("$I$140", result.Root.Children[3].Text, "fully absolute reference span");
+            AssertEqual("'Sheet 1'!I$140", result.Root.Children[4].Text, "quoted qualified reference span");
+            AssertEqual("Sheet2!$I140", result.Root.Children[5].Text, "unquoted qualified reference span");
+            AssertEqual(FormulaNodeKind.Name, result.Root.Children[6].Kind, "name remains a name token");
+            AssertEqual("Income", result.Root.Children[6].Text, "name span remains intact");
         }
 
         private static void StringAndNumericLiterals()
@@ -211,6 +237,230 @@ namespace FormulaNavigator.Core.Tests
             AssertEqual("^", result.Root.Children[0].Operator, "exponentiation binds after unary negation in Excel precedence");
             AssertEqual(FormulaNodeKind.Unary, result.Root.Children[0].Children[0].Kind, "negation is exponent base");
             AssertEqual("*", result.Root.Children[1].Operator, "multiplication binds before addition");
+        }
+
+        private static void DependencyPlanStaticRangesAndIntersections()
+        {
+            FormulaParseResult qualified = FormulaParser.Parse("=Sheet2!A1:B2");
+            Assert(qualified.Success, Diagnostics(qualified));
+            FormulaDependencyPlan qualifiedPlan = FormulaDependencyPlan.Create(qualified.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(1, qualifiedPlan.References.Count, "qualified range remains one dependency");
+            AssertEqual("Sheet2", qualifiedPlan.References[0].Sheet, "left range qualifier propagates to right endpoint");
+            AssertEqual(2, qualifiedPlan.References[0].EndColumn, "qualified range end column");
+
+            FormulaParseResult expression = FormulaParser.Parse("=(A1,B2)");
+            Assert(expression.Success, Diagnostics(expression));
+            FormulaDependencyPlan plan = FormulaDependencyPlan.Create(expression.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(2, plan.References.Count, "union members are projected");
+            AssertArea(plan.References[0], "Book.xlsx", "Sheet1", 1, 1, 1, 1, "union first member");
+            AssertArea(plan.References[1], "Book.xlsx", "Sheet1", 2, 2, 2, 2, "union second member");
+            AssertEqual(0, plan.DynamicNodes.Count, "fully static expression has no opaque nodes");
+
+            FormulaParseResult intersection = FormulaParser.Parse("=A1:A10 A5:A15");
+            Assert(intersection.Success, Diagnostics(intersection));
+            FormulaDependencyPlan intersectionPlan = FormulaDependencyPlan.Create(intersection.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(1, intersectionPlan.References.Count, "static intersection produces one dependency");
+            AssertArea(intersectionPlan.References[0], "Book.xlsx", "Sheet1", 5, 10, 1, 1, "intersection is its actual overlap");
+        }
+
+        private static void DependencyPlanDynamicAndExternalReferences()
+        {
+            FormulaParseResult dynamic = FormulaParser.Parse("=OFFSET(A1,B1,0)+INDIRECT(\"C1\")+A2#+Mystery(C2)");
+            Assert(dynamic.Success, Diagnostics(dynamic));
+            FormulaDependencyPlan plan = FormulaDependencyPlan.Create(dynamic.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(3, plan.References.Count, "OFFSET arguments and unknown function arguments remain dependencies");
+            AssertArea(plan.References[0], "Book.xlsx", "Sheet1", 1, 1, 1, 1, "OFFSET base reference");
+            AssertArea(plan.References[1], "Book.xlsx", "Sheet1", 1, 1, 2, 2, "OFFSET row argument reference");
+            AssertArea(plan.References[2], "Book.xlsx", "Sheet1", 2, 2, 3, 3, "unknown function argument reference");
+            AssertEqual(3, plan.DynamicNodes.Count, "OFFSET, INDIRECT and spill are opaque");
+            AssertEqual("OFFSET(A1,B1,0)", plan.DynamicNodes[0].Text, "OFFSET keeps its source span");
+            AssertEqual("INDIRECT(\"C1\")", plan.DynamicNodes[1].Text, "INDIRECT keeps its source span");
+            AssertEqual("A2#", plan.DynamicNodes[2].Text, "spill keeps its source span");
+
+            FormulaParseResult complexIntersection = FormulaParser.Parse("=A1 BaseName");
+            Assert(complexIntersection.Success, Diagnostics(complexIntersection));
+            FormulaDependencyPlan complexPlan = FormulaDependencyPlan.Create(complexIntersection.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(0, complexPlan.References.Count, "complex intersection does not invent an endpoint dependency");
+            AssertEqual(1, complexPlan.DynamicNodes.Count, "complex intersection is opaque");
+            AssertEqual("A1 BaseName", complexPlan.DynamicNodes[0].Text, "complex intersection keeps exact span");
+
+            FormulaParseResult external = FormulaParser.Parse("=SUM([Other.xlsx]Sheet1!A1,[Other.xlsx]Sheet1!B1:C2)");
+            Assert(external.Success, Diagnostics(external));
+            FormulaDependencyPlan externalPlan = FormulaDependencyPlan.Create(external.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(0, externalPlan.References.Count, "external references are excluded from the local index");
+            AssertEqual(2, externalPlan.Warnings.Count, "each external source expression reports a warning");
+        }
+
+        private static void DependencyPlanStaticOffset()
+        {
+            FormulaParseResult shifted = FormulaParser.Parse("=OFFSET(I$140,0,-4)+A1:A10 A5:A15");
+            Assert(shifted.Success, Diagnostics(shifted));
+            FormulaDependencyPlan shiftedPlan = FormulaDependencyPlan.Create(shifted.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(3, shiftedPlan.References.Count, "static OFFSET target, base, and intersection are retained");
+            AssertArea(shiftedPlan.References[0], "Book.xlsx", "Sheet1", 140, 140, 5, 5, "shifted OFFSET target");
+            AssertArea(shiftedPlan.References[1], "Book.xlsx", "Sheet1", 140, 140, 9, 9, "OFFSET base remains a dependency");
+            AssertArea(shiftedPlan.References[2], "Book.xlsx", "Sheet1", 5, 10, 1, 1, "ordinary intersection still resolves");
+            AssertEqual(0, shiftedPlan.DynamicNodes.Count, "literal OFFSET arguments avoid dynamic resolution");
+
+            FormulaParseResult sized = FormulaParser.Parse("=OFFSET($H$127,0,4,2,3)");
+            Assert(sized.Success, Diagnostics(sized));
+            FormulaDependencyPlan sizedPlan = FormulaDependencyPlan.Create(sized.Root, "Book.xlsx", "Sheet1");
+            AssertArea(sizedPlan.References[0], "Book.xlsx", "Sheet1", 127, 128, 12, 14, "literal height and width resize the target");
+
+            FormulaParseResult rangeBase = FormulaParser.Parse("=OFFSET(A1:B2,1,1)");
+            Assert(rangeBase.Success, Diagnostics(rangeBase));
+            FormulaDependencyPlan rangeBasePlan = FormulaDependencyPlan.Create(rangeBase.Root, "Book.xlsx", "Sheet1");
+            AssertArea(rangeBasePlan.References[0], "Book.xlsx", "Sheet1", 2, 3, 2, 3, "range OFFSET preserves its base dimensions");
+            AssertArea(rangeBasePlan.References[1], "Book.xlsx", "Sheet1", 1, 2, 1, 2, "range OFFSET base remains a dependency");
+
+            FormulaParseResult crossSheet = FormulaParser.Parse("=OFFSET(Sheet2!A1,1,2)");
+            Assert(crossSheet.Success, Diagnostics(crossSheet));
+            FormulaDependencyPlan crossSheetPlan = FormulaDependencyPlan.Create(crossSheet.Root, "Book.xlsx", "Sheet1");
+            AssertArea(crossSheetPlan.References[0], "Book.xlsx", "Sheet2", 2, 2, 3, 3, "cross-sheet OFFSET target");
+            AssertArea(crossSheetPlan.References[1], "Book.xlsx", "Sheet2", 1, 1, 1, 1, "cross-sheet OFFSET base");
+
+            FormulaParseResult outOfBounds = FormulaParser.Parse("=OFFSET(A1,-1,0)");
+            Assert(outOfBounds.Success, Diagnostics(outOfBounds));
+            FormulaDependencyPlan outOfBoundsPlan = FormulaDependencyPlan.Create(outOfBounds.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(1, outOfBoundsPlan.DynamicNodes.Count, "out-of-bounds OFFSET remains dynamic");
+            AssertEqual("OFFSET(A1,-1,0)", outOfBoundsPlan.DynamicNodes[0].Text, "dynamic OFFSET keeps its source span");
+            AssertEqual(1, outOfBoundsPlan.References.Count, "out-of-bounds OFFSET still retains its base");
+        }
+
+        private static void DependencyPlanIntersectionResolutionCap()
+        {
+            string repeatedUnion = RepeatedUnion("A1", 50);
+            FormulaParseResult pathological = FormulaParser.Parse("=" + repeatedUnion + " " + repeatedUnion);
+            Assert(pathological.Success, Diagnostics(pathological));
+            FormulaDependencyPlan plan = FormulaDependencyPlan.Create(pathological.Root, "Book.xlsx", "Sheet1");
+            AssertEqual(0, plan.References.Count, "capped intersection skips its partial static result");
+            AssertEqual(0, plan.DynamicNodes.Count, "capped intersection does not schedule an expensive dynamic resolution");
+            AssertEqual(1, plan.Warnings.Count, "capped intersection has one explicit warning");
+            Assert(Contains(plan.Warnings, "capped"), "cap warning explains the partial result");
+        }
+
+        private static string RepeatedUnion(string value, int count)
+        {
+            string result = "(";
+            for (int i = 0; i < count; i++)
+            {
+                if (i != 0) result += ",";
+                result += value;
+            }
+            return result + ")";
+        }
+
+        private static void DependencyRangeIndexTests()
+        {
+            var dependencies = new List<IndexedDependency>
+            {
+                new IndexedDependency(new ReferenceArea("Book.xlsx", "Sheet1", 1, ReferenceParser.MaxRows, 1, 1), 10),
+                new IndexedDependency(new ReferenceArea("Book.xlsx", "Sheet1", 2, 2, 1, ReferenceParser.MaxColumns), 11),
+                new IndexedDependency(new ReferenceArea("Book.xlsx", "Sheet1", 3, 4, 3, 4), 12),
+                new IndexedDependency(new ReferenceArea("book.xlsx", "sheet1", 3, 3, 3, 3), 12),
+                new IndexedDependency(new ReferenceArea("Book.xlsx", "Sheet2", 1, 1, 1, 1), 99)
+            };
+            var index = new DependencyRangeIndex(dependencies);
+            AssertIds(new[] { 11 }, index.Find(new ReferenceArea("BOOK.XLSX", "SHEET1", 2, 2, 3, 3)), "whole row query");
+            AssertIds(new[] { 12 }, index.Find(new ReferenceArea("Book.xlsx", "Sheet1", 3, 3, 3, 3)), "formula ids are deduplicated");
+            AssertIds(new[] { 11, 12 }, index.Find(new ReferenceArea("Book.xlsx", "Sheet1", 2, 3, 3, 3)), "range query includes both rows");
+            AssertIds(new[] { 10, 11 }, index.Find(new ReferenceArea("Book.xlsx", "Sheet1", 2, 2, 1, 1)), "whole column and row query");
+            AssertIds(new int[0], index.Find(new ReferenceArea("Book.xlsx", "Sheet2", 2, 2, 2, 2)), "sheet groups are isolated");
+
+            ReferenceArea[] queries =
+            {
+                new ReferenceArea("Book.xlsx", "Sheet1", 1, 1, 1, 1),
+                new ReferenceArea("Book.xlsx", "Sheet1", 2, 2, 3, 3),
+                new ReferenceArea("Book.xlsx", "Sheet1", 3, 3, 3, 3),
+                new ReferenceArea("Book.xlsx", "Sheet1", 100, 100, 5, 5),
+                new ReferenceArea("Book.xlsx", "Sheet2", 1, 1, 1, 1)
+            };
+            for (int i = 0; i < queries.Length; i++)
+                AssertIds(BruteForce(dependencies, queries[i]), index.Find(queries[i]), "range index agrees with brute force query " + i);
+
+            // Exceed the 16-entry leaf size so these checks exercise tree splitting and pruning,
+            // including nested/overlapping rectangles, duplicate ids and whole rows/columns.
+            var random = new Random(71239);
+            for (int i = 0; i < 2048; i++)
+            {
+                int row = random.Next(1, 2000);
+                int column = random.Next(1, 200);
+                int lastRow = row + random.Next(0, 100);
+                int lastColumn = column + random.Next(0, 30);
+                if (i % 31 == 0) { row = 1; lastRow = ReferenceParser.MaxRows; }
+                if (i % 37 == 0) { column = 1; lastColumn = ReferenceParser.MaxColumns; }
+                dependencies.Add(new IndexedDependency(new ReferenceArea(i % 5 == 0 ? "Other.xlsx" : "Book.xlsx",
+                    i % 3 == 0 ? "Sheet2" : "Sheet1", row, lastRow, column, lastColumn), i % 511));
+            }
+            index = new DependencyRangeIndex(dependencies);
+            for (int i = 0; i < 500; i++)
+            {
+                int row = random.Next(1, 2100);
+                int column = random.Next(1, 240);
+                var query = new ReferenceArea(i % 5 == 0 ? "OTHER.xlsx" : "BOOK.xlsx",
+                    i % 3 == 0 ? "SHEET2" : "SHEET1", row, row + random.Next(0, 25), column, column + random.Next(0, 5));
+                AssertIds(BruteForce(dependencies, query), index.Find(query), "tree agrees with exhaustive intersection " + i);
+            }
+            var fullSheet = new ReferenceArea("Book.xlsx", "Sheet1", 1, ReferenceParser.MaxRows, 1, ReferenceParser.MaxColumns);
+            AssertIds(BruteForce(dependencies, fullSheet), index.Find(fullSheet), "full-sheet query");
+            AssertIds(new int[0], index.Find(new ReferenceArea("Missing.xlsx", "Sheet1", 1, 1, 1, 1)), "unknown workbook");
+        }
+
+        private static void FormulaReadBlockCoverage()
+        {
+            var blocks = new List<FormulaReadBlock>(FormulaReadBlocks.Enumerate(100, 129));
+            AssertEqual(8, blocks.Count, "100 by 129 is split into fixed row bands across both column strips");
+            bool[,] covered = new bool[101, 130];
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                FormulaReadBlock block = blocks[i];
+                Assert(block.Row >= 1 && block.Column >= 1, "block offsets are one-based");
+                Assert(block.Height * block.Width <= 4096, "block stays within cell limit");
+                for (int row = block.Row; row < block.Row + block.Height; row++)
+                    for (int column = block.Column; column < block.Column + block.Width; column++)
+                    {
+                        Assert(!covered[row, column], "blocks do not overlap");
+                        covered[row, column] = true;
+                    }
+            }
+            for (int row = 1; row <= 100; row++)
+                for (int column = 1; column <= 129; column++)
+                    Assert(covered[row, column], "every requested cell is covered");
+
+            AssertEqual(1, new List<FormulaReadBlock>(FormulaReadBlocks.Enumerate(1, 128)).Count,
+                "max-width boundary uses one strip");
+            AssertEqual(2, new List<FormulaReadBlock>(FormulaReadBlocks.Enumerate(1, 129)).Count,
+                "one column beyond the boundary uses two strips");
+        }
+
+        private static void AssertArea(ReferenceArea area, string workbook, string sheet, int startRow, int endRow,
+            int startColumn, int endColumn, string message)
+        {
+            AssertEqual(workbook, area.Workbook, message + " workbook");
+            AssertEqual(sheet, area.Sheet, message + " sheet");
+            AssertEqual(startRow, area.StartRow, message + " start row");
+            AssertEqual(endRow, area.EndRow, message + " end row");
+            AssertEqual(startColumn, area.StartColumn, message + " start column");
+            AssertEqual(endColumn, area.EndColumn, message + " end column");
+        }
+
+        private static IEnumerable<int> BruteForce(IList<IndexedDependency> dependencies, ReferenceArea source)
+        {
+            var ids = new List<int>();
+            for (int i = 0; i < dependencies.Count; i++)
+            {
+                if (dependencies[i].Area.Intersects(source) && !ids.Contains(dependencies[i].FormulaId))
+                    ids.Add(dependencies[i].FormulaId);
+            }
+            ids.Sort();
+            return ids;
+        }
+
+        private static void AssertIds(IEnumerable<int> expected, IReadOnlyList<int> actual, string message)
+        {
+            var expectedValues = new List<int>(expected);
+            AssertEqual(expectedValues.Count, actual.Count, message + " count");
+            for (int i = 0; i < expectedValues.Count; i++) AssertEqual(expectedValues[i], actual[i], message + " item " + i);
         }
 
         private static void AssertNode(FormulaNode node, FormulaNodeKind kind, string text, int start, string name)
