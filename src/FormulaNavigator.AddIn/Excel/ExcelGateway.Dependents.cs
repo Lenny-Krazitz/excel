@@ -28,19 +28,27 @@ namespace FormulaNavigator.AddIn.Excel
             {
                 cancellation.ThrowIfCancellationRequested();
                 StartIndexing();
-                ReconcileWorkbooks();
-                object workbook = FindOpenWorkbook(location.Workbook);
-                WorkbookIndex session = _indexes[ComIdentity(workbook)];
-                string schema = ReadSchema(session);
+                // The prepared session is keyed by a managed workbook name. Do not reconcile
+                // Workbooks or read every worksheet/table/name on the hot query path: both are
+                // already maintained by Excel events and made a ready index scale with sheet count.
+                WorkbookIndex session = _indexes.Values.FirstOrDefault(candidate => !candidate.Closed &&
+                    String.Equals(candidate.Name, location.Workbook, StringComparison.OrdinalIgnoreCase));
+                if (session == null)
+                {
+                    // Covers a command invoked before the 50 ms background pump sees a newly
+                    // opened book. This is initialization, not work repeated for every cell.
+                    ReconcileWorkbooks();
+                    session = _indexes.Values.FirstOrDefault(candidate => !candidate.Closed &&
+                        String.Equals(candidate.Name, location.Workbook, StringComparison.OrdinalIgnoreCase));
+                }
+                if (session == null) throw new InvalidOperationException("Книга '" + location.Workbook + "' не открыта.");
                 bool canReuse = _eventsConnected && Convert.ToBoolean(_application.EnableEvents, CultureInfo.InvariantCulture);
-                if (forceRefresh || !canReuse || session.SchemaWarning != null || session.Error != null || session.Schema != schema)
-                    InvalidatePlan(session);
+                if (forceRefresh || !canReuse || session.Error != null) InvalidatePlan(session);
                 if (!canReuse)
                     refreshWarning = "События Excel недоступны: книга перечитана полностью. После правок с отключёнными событиями используйте «Обновить».";
-                session.Schema = schema;
                 reused = session.Snapshot != null && session.Dynamic != null;
                 session.Demand++;
-                _priorityWorkbook = ComIdentity(workbook);
+                _priorityWorkbook = ComIdentity(session.Workbook);
                 return session;
             }).ConfigureAwait(false);
 
@@ -107,16 +115,11 @@ namespace FormulaNavigator.AddIn.Excel
                     {
                         cancellation.ThrowIfCancellationRequested();
                         if (state.Closed) throw new InvalidOperationException("Книга закрыта.");
-                        if (!ReferenceEquals(state.Snapshot, query.Plan) || !ReferenceEquals(state.Dynamic, query.Dynamic)) return false;
-                        string schema = ReadSchema(state);
-                        if (!ReferenceEquals(state.Snapshot, query.Plan) || !ReferenceEquals(state.Dynamic, query.Dynamic)) return false;
-                        if (state.Schema != schema)
-                        {
-                            InvalidatePlan(state);
-                            return false;
-                        }
-                        bool stable = IsCalculationStable();
-                        return stable && ReferenceEquals(state.Snapshot, query.Plan) && ReferenceEquals(state.Dynamic, query.Dynamic);
+                        // Every relevant Excel event invalidates the generation and replaces one
+                        // of these references. This constant-time check prevents returning an old
+                        // result without rescanning workbook metadata after every selected cell.
+                        return IsCalculationStable() && ReferenceEquals(state.Snapshot, query.Plan)
+                            && ReferenceEquals(state.Dynamic, query.Dynamic);
                     }).ConfigureAwait(false);
                     if (current) return new DependencyResult(result.Cells, result.Warnings, result.FormulaCount,
                         result.IndexReused, elapsed.ElapsedMilliseconds);
