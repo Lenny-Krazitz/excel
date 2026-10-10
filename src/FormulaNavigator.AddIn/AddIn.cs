@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Windows;
 using System.Windows.Interop;
 using ExcelDna.Integration;
@@ -95,6 +96,24 @@ namespace FormulaNavigator.AddIn
             catch (Exception error) { Report(error); }
         }
 
+        [ExcelCommand(Name = "FormulaNavigator_CompareNativeDependents",
+            Description = "Сравнить штатную трассировку Excel с текущим индексом без изменения Ctrl+Shift+Q",
+            MenuName = MenuName, MenuText = "Эксперимент: штатные зависимые")]
+        public static async void CompareNativeDependents()
+        {
+            try
+            {
+                EnsureReady();
+                if (ActivateOpenDialog()) return;
+                InspectionContext context = gateway.CaptureActiveCell();
+                string report = await gateway.CompareNativeDependentsAsync(context.Location, CancellationToken.None);
+                if (!shuttingDown)
+                    MessageBox.Show(report, "Formula Navigator — эксперимент", MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+            }
+            catch (Exception error) { Report(error); }
+        }
+
         [ExcelCommand(Name = "FormulaNavigator_Status", Description = "Проверить загрузку надстройки",
             MenuName = MenuName, MenuText = "Проверить подключение")]
         public static void ShowStatus()
@@ -141,7 +160,6 @@ namespace FormulaNavigator.AddIn
 
         private static void RegisterKeys()
         {
-            // Excel's native ON.KEY uses uppercase letters for Ctrl+Shift combinations.
             XlCall.Excel(XlCall.xlcOnKey, ExploreKey, "FormulaNavigator_Explore");
             keysRegistered = true;
             XlCall.Excel(XlCall.xlcOnKey, DependentsKey, "FormulaNavigator_Dependents");
@@ -163,12 +181,10 @@ namespace FormulaNavigator.AddIn
             {
                 if (owner != null) window.Owner = owner;
                 else SetExcelOwner(window);
-                // WPF's modal message loop routes keys before Excel's worksheet message loop.
                 window.ShowDialog();
                 if (shuttingDown) return;
                 if (owner != null)
                 {
-                    // Enter in the nested inspector completes navigation all the way to Excel.
                     if (owner.IsVisible && window.SelectionAccepted) owner.AcceptNavigation(window.ExitLocation);
                 }
                 else NavigateAfterDialog(window.ExitLocation);
@@ -196,8 +212,6 @@ namespace FormulaNavigator.AddIn
         private static void NavigateAfterDialog(ExcelLocation location)
         {
             if (shuttingDown || location == null) return;
-            // Closing a modal window reactivates the previous HWND. Apply the chosen cell
-            // afterwards so this does not undo a transition to another workbook/window.
             gateway.Navigate(location);
         }
 
