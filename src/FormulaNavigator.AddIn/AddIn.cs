@@ -71,7 +71,7 @@ namespace FormulaNavigator.AddIn
         }
 
         [ExcelCommand(Name = "FormulaNavigator_Dependents", Description = "Найти зависимые ячейки во всей книге",
-            MenuName = MenuName, MenuText = "Зависимые ячейки (Ctrl+Shift+Q)")]
+            MenuName = MenuName, MenuText = "Зависимые ячейки (обычный поиск)")]
         public static void FindDependents()
         {
             try
@@ -97,8 +97,8 @@ namespace FormulaNavigator.AddIn
         }
 
         [ExcelCommand(Name = "FormulaNavigator_CompareNativeDependents",
-            Description = "Сравнить штатную трассировку Excel с текущим индексом без изменения Ctrl+Shift+Q",
-            MenuName = MenuName, MenuText = "Эксперимент: штатные зависимые")]
+            Description = "ВРЕМЕННАЯ ДИАГНОСТИКА: сравнить штатную трассировку Excel с текущим индексом",
+            MenuName = MenuName, MenuText = "Временная диагностика: штатные зависимые (Ctrl+Shift+Q)")]
         public static async void CompareNativeDependents()
         {
             try
@@ -108,7 +108,7 @@ namespace FormulaNavigator.AddIn
                 InspectionContext context = gateway.CaptureActiveCell();
                 string report = await gateway.CompareNativeDependentsAsync(context.Location, CancellationToken.None);
                 if (!shuttingDown)
-                    MessageBox.Show(report, "Formula Navigator — эксперимент", MessageBoxButton.OK,
+                    MessageBox.Show(report, "Formula Navigator — временная диагностика", MessageBoxButton.OK,
                         MessageBoxImage.Information);
             }
             catch (Exception error) { Report(error); }
@@ -162,7 +162,8 @@ namespace FormulaNavigator.AddIn
         {
             XlCall.Excel(XlCall.xlcOnKey, ExploreKey, "FormulaNavigator_Explore");
             keysRegistered = true;
-            XlCall.Excel(XlCall.xlcOnKey, DependentsKey, "FormulaNavigator_Dependents");
+            // ВРЕМЕННО: Ctrl+Shift+Q запускает диагностику штатной трассировки. Вернуть на FormulaNavigator_Dependents после сбора отчётов.
+            XlCall.Excel(XlCall.xlcOnKey, DependentsKey, "FormulaNavigator_CompareNativeDependents");
         }
 
         private static void OpenLocation(ExcelLocation location)
