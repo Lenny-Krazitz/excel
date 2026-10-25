@@ -74,13 +74,14 @@ namespace FormulaNavigator.AddIn.Excel
     public sealed class DependencyResult
     {
         public DependencyResult(IReadOnlyList<DependentCell> cells, IReadOnlyList<string> warnings, int formulaCount,
-            bool indexReused = false, long elapsedMilliseconds = 0)
+            bool indexReused = false, long elapsedMilliseconds = 0, bool fromNativeTrace = false)
         {
             Cells = cells ?? new List<DependentCell>().AsReadOnly();
             Warnings = warnings ?? new List<string>().AsReadOnly();
             FormulaCount = formulaCount;
             IndexReused = indexReused;
             ElapsedMilliseconds = elapsedMilliseconds;
+            FromNativeTrace = fromNativeTrace;
         }
 
         public IReadOnlyList<DependentCell> Cells { get; private set; }
@@ -88,5 +89,8 @@ namespace FormulaNavigator.AddIn.Excel
         public int FormulaCount { get; private set; }
         public bool IndexReused { get; private set; }
         public long ElapsedMilliseconds { get; private set; }
+        // True when the result comes from the built-in Excel tracer search rather
+        // than the reverse index.
+        public bool FromNativeTrace { get; private set; }
     }
 }

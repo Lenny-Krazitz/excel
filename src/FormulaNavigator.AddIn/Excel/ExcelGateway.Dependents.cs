@@ -14,10 +14,28 @@ namespace FormulaNavigator.AddIn.Excel
         private static readonly ResolvedDependencies EmptyResolvedDependencies =
             new ResolvedDependencies(new DependencyRangeIndex(new IndexedDependency[0]), new string[0]);
 
+        // Ctrl+Shift+Q entry point. The built-in Excel tracer search runs first;
+        // the reverse index is the automatic fallback for every case the tracer
+        // cannot confirm. forceRefresh only affects the fallback: a successful
+        // native search is always current, so it is never rebuilt.
         public async Task<DependencyResult> FindDependentsAsync(ExcelLocation location, CancellationToken cancellation,
             IProgress<string> progress, bool forceRefresh = false)
         {
             if (location == null) throw new ArgumentNullException(nameof(location));
+            NativeSearchOutcome native = await TryFindNativeDependentsAsync(location, cancellation, progress)
+                .ConfigureAwait(false);
+            if (native.Result != null) return native.Result;
+            DependencyResult indexed = await FindIndexDependentsAsync(location, cancellation, progress, forceRefresh)
+                .ConfigureAwait(false);
+            if (String.IsNullOrEmpty(native.Warning)) return indexed;
+            var warnings = new List<string>(indexed.Warnings) { native.Warning };
+            return new DependencyResult(indexed.Cells, warnings.AsReadOnly(), indexed.FormulaCount,
+                indexed.IndexReused, indexed.ElapsedMilliseconds);
+        }
+
+        private async Task<DependencyResult> FindIndexDependentsAsync(ExcelLocation location, CancellationToken cancellation,
+            IProgress<string> progress, bool forceRefresh)
+        {
             ReferenceArea source;
             if (!ReferenceParser.TryParse(location.Address, location.Workbook, location.Sheet, out source))
                 throw new InvalidOperationException("Выбранный адрес не является поддерживаемым A1-диапазоном.");
@@ -173,13 +191,14 @@ namespace FormulaNavigator.AddIn.Excel
                     cancellation.ThrowIfCancellationRequested();
                     return new ResolvedDependencies(index, warnings);
                 }, cancellation).ConfigureAwait(false);
-                await OnExcelThread(() =>
+                // Do not capture the COM-bearing reader in the worker delegate.
+                await ApplyOnExcelThreadWhenIdleAsync(delegate
                 {
                     if (!state.Closed && ReferenceEquals(state.DynamicCancellation, generation))
                     {
                         bool stable = IsCalculationStable();
                         string schema = ReadSchema(state);
-                        if (state.Closed || !ReferenceEquals(state.DynamicCancellation, generation)) return false;
+                        if (state.Closed || !ReferenceEquals(state.DynamicCancellation, generation)) return true;
                         if (!stable) InvalidateDynamic(state);
                         else if (state.Schema != schema) InvalidatePlan(state);
                         else
@@ -189,7 +208,7 @@ namespace FormulaNavigator.AddIn.Excel
                         }
                     }
                     return true;
-                }).ConfigureAwait(false);
+                }, cancellation).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception error) { await RecordBuildError(state, generation, true, error).ConfigureAwait(false); }

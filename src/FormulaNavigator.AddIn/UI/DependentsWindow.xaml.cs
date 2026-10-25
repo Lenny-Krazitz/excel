@@ -69,7 +69,7 @@ namespace FormulaNavigator.AddIn.UI
             RefreshButton.IsEnabled = false;
             CancelButton.IsEnabled = true;
             SearchProgress.Visibility = Visibility.Visible;
-            StatusLabel.Text = forceRefresh ? "Перестраиваю индекс книги…" : "Проверяю индекс книги…";
+            StatusLabel.Text = forceRefresh ? "Обновляю поиск…" : "Ищу зависимые ячейки…";
             WarningsPanel.Visibility = Visibility.Collapsed;
             cells.Clear();
             ApplyFilter();
@@ -84,9 +84,15 @@ namespace FormulaNavigator.AddIn.UI
                 if (closing) return;
                 cells.AddRange(result.Cells);
                 ApplyFilter();
-                StatusLabel.Text = "Найдено ячеек: " + cells.Count + ". Формул в индексе: " + result.FormulaCount
-                    + (result.IndexReused ? ". Готовый индекс." : ". Индекс обновлён.")
-                    + " Поиск: " + (result.ElapsedMilliseconds / 1000.0).ToString("0.00") + " с.";
+                string status;
+                if (result.FromNativeTrace)
+                    status = "Найдено ячеек: " + cells.Count + ". Штатная трассировка Excel. Поиск: "
+                        + (result.ElapsedMilliseconds / 1000.0).ToString("0.00") + " с.";
+                else
+                    status = "Найдено ячеек: " + cells.Count + ". Формул в индексе: " + result.FormulaCount
+                        + (result.IndexReused ? ". Готовый индекс." : ". Индекс обновлён.")
+                        + " Поиск: " + (result.ElapsedMilliseconds / 1000.0).ToString("0.00") + " с.";
+                StatusLabel.Text = status;
                 if (result.Warnings.Count != 0)
                 {
                     WarningsBox.Text = string.Join(Environment.NewLine, result.Warnings);

@@ -20,12 +20,12 @@ namespace FormulaNavigator.AddIn.Excel
                 // The input contains strings and locations only, never Excel RCWs.
                 DependencySnapshot snapshot = await Task.Run(() => ParseSnapshot(formulas, cancellation), cancellation)
                     .ConfigureAwait(false);
-                await OnExcelThread(() =>
+                await ApplyOnExcelThreadWhenIdleAsync(delegate
                 {
                     if (!state.Closed && ReferenceEquals(state.PlanCancellation, generation))
                     {
                         string schema = ReadSchema(state);
-                        if (state.Closed || !ReferenceEquals(state.PlanCancellation, generation)) return false;
+                        if (state.Closed || !ReferenceEquals(state.PlanCancellation, generation)) return true;
                         if (state.Schema != schema) InvalidatePlan(state);
                         else
                         {
@@ -36,7 +36,7 @@ namespace FormulaNavigator.AddIn.Excel
                         }
                     }
                     return true;
-                }).ConfigureAwait(false);
+                }, cancellation).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception error)
@@ -50,7 +50,7 @@ namespace FormulaNavigator.AddIn.Excel
         {
             try
             {
-                await OnExcelThread(() =>
+                await ApplyOnExcelThreadWhenIdleAsync(delegate
                 {
                     if (!state.Closed && ReferenceEquals(dynamic ? state.DynamicCancellation : state.PlanCancellation, generation))
                     {
@@ -59,7 +59,7 @@ namespace FormulaNavigator.AddIn.Excel
                         state.DynamicBuilding = false;
                     }
                     return true;
-                }).ConfigureAwait(false);
+                }, (dynamic ? state.DynamicCancellation : state.PlanCancellation).Token).ConfigureAwait(false);
             }
             catch (Exception) { /* The dispatcher can disappear while the add-in shuts down. */ }
         }

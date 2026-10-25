@@ -25,6 +25,10 @@ namespace FormulaNavigator.AddIn.Excel
         private string _eventError;
         private DateTime _reconcileAfter = DateTime.MinValue;
         private IntPtr _priorityWorkbook;
+        // Non-zero while the built-in tracer search runs on Excel's thread. The
+        // background indexer then defers its COM work instead of interleaving it
+        // with the trace; prepared indexes are kept and reused afterwards.
+        private int _nativeTraceActive;
 
         public string IndexingStatus
         {
@@ -267,7 +271,7 @@ namespace FormulaNavigator.AddIn.Excel
 
         private void PumpIndexes(object sender, EventArgs args)
         {
-            if (_disposed || _pumping) return;
+            if (_disposed || _pumping || _nativeTraceActive != 0) return;
             _pumping = true;
             WorkbookIndex selected = null;
             try
@@ -403,6 +407,22 @@ namespace FormulaNavigator.AddIn.Excel
         {
             string text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? String.Empty;
             schema.Append(text.Length).Append(':').Append(text);
+        }
+
+        // Runs a state-applying delegate on Excel's thread once the tracer search
+        // is no longer active. The delegate returns false when it was not applied;
+        // the call is then retried after a delay until the token is cancelled or a
+        // safety cap is reached.
+        private async Task ApplyOnExcelThreadWhenIdleAsync(Func<bool> apply, CancellationToken cancellation)
+        {
+            for (int attempt = 0; attempt < 1200; attempt++)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                bool applied = await OnExcelThread(() => _nativeTraceActive == 0 && apply()).ConfigureAwait(false);
+                if (applied) return;
+                try { await Task.Delay(50, cancellation).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+            }
         }
 
         private Task<T> OnExcelThread<T>(Func<T> action)
