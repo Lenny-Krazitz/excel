@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using FormulaNavigator.Core;
 
 namespace FormulaNavigator.Core.Tests
@@ -38,6 +40,13 @@ namespace FormulaNavigator.Core.Tests
             Run("dependency plan intersection resolution cap", DependencyPlanIntersectionResolutionCap);
             Run("dependency range index", DependencyRangeIndexTests);
             Run("formula read block coverage", FormulaReadBlockCoverage);
+            Run("native trace area merge and normalization", NativeTraceAreaMergeAndNormalization);
+            Run("native trace cell expansion and budget", NativeTraceCellExpansionAndBudget);
+            Run("native trace fallback decision matrix", NativeTraceFallbackDecisionMatrix);
+            Run("native trace enumeration sequences", NativeTraceEnumerationSequences);
+            Run("native trace cleanup and restore", NativeTraceCleanupAndRestore);
+            Run("native trace cancellation and unexpected errors", NativeTraceCancellationAndErrors);
+            Run("add-in command bindings", AddInCommandBindings);
             Console.WriteLine(_failures == 0 ? "All FormulaNavigator.Core tests passed." : _failures + " test(s) failed.");
             return _failures == 0 ? 0 : 1;
         }
@@ -575,6 +584,322 @@ namespace FormulaNavigator.Core.Tests
         private static void AssertEqual<T>(T expected, T actual, string message)
         {
             if (!Object.Equals(expected, actual)) throw new InvalidOperationException(message + "; expected '" + expected + "', actual '" + actual + "'.");
+        }
+
+        private static NativeTraceArea Area(string workbook, string sheet, string address)
+        {
+            return new NativeTraceArea(workbook, sheet, address);
+        }
+
+        private static NativeArrowStep Step(params NativeTraceArea[] areas)
+        {
+            return NativeArrowStep.CapturedStep(areas);
+        }
+
+        private sealed class FakeTraceHost : INativeTraceHost
+        {
+            public readonly List<string> Calls = new List<string>();
+            public readonly List<string> CleanupFailuresList = new List<string>();
+            public Func<int, int?, NativeArrowStep> NavigateImpl = delegate { return NativeArrowStep.FailedStep("нет стрелки"); };
+            public bool SaveStateResult = true;
+            public UserArrowCheck ArrowCheck = UserArrowCheck.NoArrows;
+            public bool CreateArrowsResult = true;
+            public bool RemoveArrowsCalled;
+            public bool RestoreCalled;
+
+            public IReadOnlyList<string> CleanupFailures { get { return CleanupFailuresList; } }
+            public string LastFailure { get; set; }
+
+            public Task<bool> TrySaveStateAsync()
+            {
+                Calls.Add("save");
+                return Task.FromResult(SaveStateResult);
+            }
+
+            public Task<UserArrowCheck> CheckUserArrowsAsync()
+            {
+                Calls.Add("check");
+                return Task.FromResult(ArrowCheck);
+            }
+
+            public Task<bool> TryCreateArrowsAsync()
+            {
+                Calls.Add("create");
+                return Task.FromResult(CreateArrowsResult);
+            }
+
+            public Task<NativeArrowStep> NavigateAsync(int arrowNumber, int? linkNumber)
+            {
+                Calls.Add("nav" + arrowNumber + ":" + (linkNumber.HasValue ? linkNumber.Value.ToString() : "-"));
+                return Task.FromResult(NavigateImpl(arrowNumber, linkNumber));
+            }
+
+            public Task RemoveCreatedArrowsAsync()
+            {
+                Calls.Add("remove");
+                RemoveArrowsCalled = true;
+                return Task.FromResult(0);
+            }
+
+            public Task RestoreStateAsync()
+            {
+                Calls.Add("restore");
+                RestoreCalled = true;
+                return Task.FromResult(0);
+            }
+        }
+
+        private static void NativeTraceAreaMergeAndNormalization()
+        {
+            AssertEqual("A1", NativeDependentTrace.NormalizeAddress("$A$1"), "absolute markers must be stripped");
+            AssertEqual("A1", NativeDependentTrace.NormalizeAddress("$A$1:$A$1"), "degenerate ranges must collapse");
+            AssertEqual("A1:B2", NativeDependentTrace.NormalizeAddress("$A$1:$B$2"), "ranges must keep both corners");
+            AssertEqual("", NativeDependentTrace.NormalizeAddress(null), "null addresses must normalize to empty");
+
+            var areas = new List<NativeTraceArea>
+            {
+                Area("Book.xlsx", "Sheet1", "$A$1"),
+                Area("Book.xlsx", "SHEET1", "A1"),
+                Area("Book.xlsx", "Sheet1", "$A$2:$A$3"),
+                Area("Book.xlsx", "Sheet2", "A1"),
+                Area("Other.xlsx", "Sheet1", "$A$1")
+            };
+            IReadOnlyList<NativeTraceArea> merged = NativeDependentTrace.MergeAreas(areas);
+            AssertEqual(4, merged.Count, "duplicates must be removed case-insensitively");
+            AssertEqual("A1", merged[0].Address, "the first occurrence must be kept");
+            AssertEqual("A2:A3", merged[1].Address, "unique areas must be kept in order");
+            AssertEqual("Sheet2", merged[2].Sheet, "other sheets must be kept");
+            AssertEqual("Other.xlsx", merged[3].Workbook, "other workbooks must be kept");
+        }
+
+        private static void NativeTraceCellExpansionAndBudget()
+        {
+            var areas = new List<NativeTraceArea>
+            {
+                Area("Book.xlsx", "Sheet1", "$A$1:$B$2"),
+                Area("Book.xlsx", "Sheet1", "B2"),
+                Area("Book.xlsx", "Sheet2", "A1")
+            };
+            IReadOnlyList<NativeTraceCell> cells;
+            AssertEqual(true, NativeDependentTrace.TryExpandCells(areas, NativeDependentTrace.MaxCells, out cells),
+                "overlapping areas must be expanded");
+            AssertEqual(5, cells.Count, "overlapping cells must be deduplicated");
+            IReadOnlyList<NativeTraceCell> ordered = NativeDependentTrace.OrderCells(cells);
+            AssertEqual("A1", ordered[0].Address, "cells must be ordered by row then column");
+            AssertEqual("B1", ordered[1].Address, "cells must be ordered by row then column");
+            AssertEqual("Sheet2", ordered[4].Sheet, "cells must be ordered by sheet");
+
+            AssertEqual(false, NativeDependentTrace.TryExpandCells(areas, 4, out cells),
+                "an over-budget result must be refused instead of truncated");
+            AssertEqual(true, NativeDependentTrace.TryExpandCells(
+                new[] { Area("Book.xlsx", "Sheet1", "$A$1:$A$1") }, 10, out cells),
+                "degenerate areas must expand to one cell");
+            AssertEqual(1, cells.Count, "degenerate areas must expand to one cell");
+        }
+
+        private static void NativeTraceFallbackDecisionMatrix()
+        {
+            foreach (NativeTraceStatus status in (NativeTraceStatus[])Enum.GetValues(typeof(NativeTraceStatus)))
+            {
+                var attempt = new NativeTraceAttempt();
+                if (status == NativeTraceStatus.Succeeded) attempt.Succeed();
+                else attempt.Fail(status, "detail");
+                NativeTraceDecision decision = NativeDependentTrace.Decide(attempt);
+                AssertEqual(status == NativeTraceStatus.Succeeded, decision.UseNative,
+                    "only a fully successful trace may be used");
+                if (!decision.UseNative)
+                    Assert(decision.Warning.Length > 0, "fallbacks must explain themselves");
+            }
+
+            var restoreFailed = new NativeTraceAttempt();
+            restoreFailed.Fail(NativeTraceStatus.RestoreFailed, "не восстановлено: выделение");
+            AssertEqual(false, NativeDependentTrace.Decide(restoreFailed).UseNative,
+                "a failed restore must never produce a usable result");
+        }
+
+        private static void NativeTraceEnumerationSequences()
+        {
+            // Several arrows on one sheet: the failing third arrow is the documented
+            // end of enumeration because the second arrow still navigates and a
+            // repeated probe of the third fails again.
+            var host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                if (arrow == 2) return Step(Area("Book.xlsx", "Sheet1", "C3"));
+                return NativeArrowStep.FailedStep("нет стрелки");
+            };
+            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a complete enumeration must succeed");
+            AssertEqual(2, attempt.Areas.Count, "both arrows must be captured");
+            Assert(host.RemoveArrowsCalled, "created arrows must be removed");
+            Assert(host.RestoreCalled, "state must be restored");
+
+            // Cross-sheet dependents inside the same workbook need no link iteration.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1 && !link.HasValue) return Step(Area("Book.xlsx", "Sheet2", "A1"));
+                if (link.HasValue) throw new InvalidOperationException("same-workbook arrows have no links");
+                return NativeArrowStep.FailedStep("end");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "cross-sheet arrows must succeed without links");
+            AssertEqual(1, attempt.Areas.Count, "the cross-sheet target must be captured");
+
+            // An external arrow: every link is enumerated and duplicates merge.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1 && !link.HasValue) return Step(Area("Other.xlsx", "Sheet1", "A1"));
+                if (arrow == 1 && link == 2) return Step(Area("Book.xlsx", "Sheet1", "D4"), Area("Other.xlsx", "Sheet1", "$A$1"));
+                return NativeArrowStep.FailedStep("end");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "external links must be enumerated");
+            // The enumerator keeps raw captures; deduplication happens when the
+            // gateway merges the areas.
+            AssertEqual(3, attempt.Areas.Count, "every captured target must be recorded");
+            AssertEqual(2, NativeDependentTrace.MergeAreas(attempt.Areas).Count,
+                "duplicate external targets must be merged");
+
+            // A transient failure of a later arrow is retried once and the
+            // enumeration continues with the same arrow.
+            host = new FakeTraceHost();
+            int arrow2Calls = 0;
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                if (arrow == 2)
+                {
+                    arrow2Calls++;
+                    return arrow2Calls == 1
+                        ? NativeArrowStep.FailedStep("transient")
+                        : Step(Area("Book.xlsx", "Sheet1", "C3"));
+                }
+                return NativeArrowStep.FailedStep("end");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a transient failure must be retried");
+            AssertEqual(2, attempt.Areas.Count, "both arrows must be captured after the retry");
+
+            // A failing first arrow is inconclusive: no dependents and a COM error
+            // are indistinguishable, so the reverse index must be used.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate { return NativeArrowStep.FailedStep("error"); };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.FirstArrowFailed, attempt.Status, "the first arrow failure is inconclusive");
+            AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
+                "an inconclusive trace must fall back to the index");
+
+            // A failing later arrow whose previous arrow no longer navigates means
+            // the trace is broken, not that enumeration ended.
+            host = new FakeTraceHost();
+            int arrow1Calls = 0;
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1)
+                {
+                    arrow1Calls++;
+                    return arrow1Calls == 1
+                        ? Step(Area("Book.xlsx", "Sheet1", "B2"))
+                        : NativeArrowStep.FailedStep("broken state");
+                }
+                return NativeArrowStep.FailedStep("error");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status,
+                "an unhealthy trace must not be reported as complete");
+        }
+
+        private static void NativeTraceCleanupAndRestore()
+        {
+            // Existing user arrows abort the trace before anything is created; the
+            // arrows are never removed and nothing is ever created.
+            var host = new FakeTraceHost { ArrowCheck = UserArrowCheck.Exists };
+            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.ExistingUserArrows, attempt.Status, "user arrows must abort the trace");
+            Assert(!host.RemoveArrowsCalled, "user arrows must never be removed");
+            Assert(!host.Calls.Contains("create"), "arrows must not be created");
+            Assert(host.RestoreCalled, "state must still be restored");
+
+            // A failed state snapshot aborts before any change is made.
+            host = new FakeTraceHost { SaveStateResult = false, LastFailure = "нет доступа" };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.SetupFailed, attempt.Status, "a failed snapshot must abort the trace");
+            Assert(!host.Calls.Contains("check"), "nothing may be changed after a failed snapshot");
+
+            // A failed user-arrow check aborts without touching arrows.
+            host = new FakeTraceHost { ArrowCheck = UserArrowCheck.CheckFailed };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.UserArrowCheckFailed, attempt.Status, "an ambiguous check must abort");
+            Assert(!host.RemoveArrowsCalled, "arrows must not be removed after an ambiguous check");
+
+            // A ShowDependents failure still removes possibly created arrows and
+            // restores the state.
+            host = new FakeTraceHost { CreateArrowsResult = false };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.ShowDependentsFailed, attempt.Status, "an arrow failure must abort");
+            Assert(host.RemoveArrowsCalled, "possibly created arrows must still be removed");
+            Assert(host.RestoreCalled, "state must be restored after a failure");
+
+            // A cleanup failure downgrades an otherwise successful trace.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                return arrow == 1
+                    ? Step(Area("Book.xlsx", "Sheet1", "B2"))
+                    : NativeArrowStep.FailedStep("end");
+            };
+            host.CleanupFailuresList.Add("не удалены созданные стрелки");
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.RestoreFailed, attempt.Status, "cleanup failures must downgrade the result");
+            AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
+                "a result with failed cleanup must not be used");
+
+            // The restore stack runs steps in reverse order, attempts every step
+            // even after failures and records the failed ones.
+            var order = new List<string>();
+            var stack = new StateRestoreStack();
+            stack.Push("первый", delegate { order.Add("первый"); });
+            stack.Push("второй", delegate { order.Add("второй"); });
+            stack.Push("третий", delegate { throw new InvalidOperationException("boom"); });
+            stack.Push("четвёртый", delegate { order.Add("четвёртый"); });
+            stack.RestoreAll();
+            AssertEqual("четвёртый,второй,первый", string.Join(",", order), "steps must run in reverse order");
+            AssertEqual(1, stack.Failures.Count, "failures must be recorded");
+            Assert(stack.Failures[0].Contains("третий"), "the failed step must be named");
+        }
+
+        private static void NativeTraceCancellationAndErrors()
+        {
+            // Cancellation during enumeration still removes the created arrows and
+            // restores the state before the exception reaches the caller.
+            var host = new FakeTraceHost();
+            host.NavigateImpl = delegate { throw new OperationCanceledException(); };
+            try
+            {
+                NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Wait();
+                Assert(false, "cancellation must propagate");
+            }
+            catch (AggregateException aggregate)
+            {
+                Assert(aggregate.InnerException is OperationCanceledException, "cancellation must propagate");
+            }
+            Assert(host.RemoveArrowsCalled, "created arrows must be removed after cancellation");
+            Assert(host.RestoreCalled, "state must be restored after cancellation");
+        }
+
+        private static void AddInCommandBindings()
+        {
+            AssertEqual(2, AddInCommands.Bindings.Count, "exactly two commands must be exposed");
+            AssertEqual("^q", AddInCommands.Bindings[0].Key, "Ctrl+Q must open the explorer");
+            AssertEqual(AddInCommands.ExploreCommand, AddInCommands.Bindings[0].Command, "Ctrl+Q must open the explorer");
+            AssertEqual("^Q", AddInCommands.Bindings[1].Key, "Ctrl+Shift+Q must open the dependents window");
+            AssertEqual(AddInCommands.DependentsCommand, AddInCommands.Bindings[1].Command,
+                "Ctrl+Shift+Q must open the dependents window");
+            AssertEqual("FormulaNavigator_Dependents", AddInCommands.DependentsCommand,
+                "the dependents command name must stay stable");
         }
     }
 
