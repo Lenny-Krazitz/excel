@@ -200,12 +200,20 @@ namespace FormulaNavigator.AddIn.Excel
 
             public Task RemoveCreatedArrowsAsync()
             {
-                return _gateway.OnExcelThread(() => RemoveCreatedArrows());
+                return _gateway.OnExcelThread(delegate
+                {
+                    RemoveCreatedArrows();
+                    return true;
+                });
             }
 
             public Task RestoreStateAsync()
             {
-                return _gateway.OnExcelThread(() => RestoreState());
+                return _gateway.OnExcelThread(delegate
+                {
+                    RestoreState();
+                    return true;
+                });
             }
 
             private bool Fail(string message)
