@@ -57,8 +57,8 @@ namespace FormulaNavigator.Core
         ExistingUserArrows,
         // Excel could not create the tracer arrows; state was restored.
         ShowDependentsFailed,
-        // The first arrow could not be navigated: "no arrows" and a COM failure are
-        // indistinguishable, so the result cannot be confirmed and the index is used.
+        // The first arrow could not be navigated: "no arrows" (no dependents) and a
+        // COM failure are indistinguishable, so the result cannot be confirmed.
         FirstArrowFailed,
         // A later arrow or link failed and even a repeated probe could not confirm
         // the end of enumeration; a partial result must not be reported as complete.
@@ -145,6 +145,9 @@ namespace FormulaNavigator.Core
         Task RemoveCreatedArrowsAsync();
         // Records its own failures through the shared restore stack.
         Task RestoreStateAsync();
+        // Records a cleanup failure that happened outside the two methods above,
+        // for example when the dispatch of a cleanup step itself failed.
+        void RecordCleanupFailure(string message);
         IReadOnlyList<string> CleanupFailures { get; }
         string LastFailure { get; }
     }
@@ -173,7 +176,7 @@ namespace FormulaNavigator.Core
         public const int MaxCells = 16384;
 
         public static async Task<NativeTraceAttempt> RunAsync(INativeTraceHost host, string sourceWorkbook,
-            CancellationToken cancellation)
+            string sourceSheet, CancellationToken cancellation)
         {
             if (host == null) throw new ArgumentNullException("host");
             var attempt = new NativeTraceAttempt();
@@ -183,7 +186,9 @@ namespace FormulaNavigator.Core
                 return attempt;
             }
             // Nothing has been changed yet; from here on the finally block must
-            // remove created arrows and restore the saved state.
+            // remove created arrows and restore the saved state. Every step of the
+            // cleanup runs even when a previous step failed, so a late error can
+            // never skip the state restoration.
             bool mayRemoveArrows = false;
             try
             {
@@ -205,7 +210,10 @@ namespace FormulaNavigator.Core
                     attempt.Fail(NativeTraceStatus.ShowDependentsFailed, host.LastFailure);
                     return attempt;
                 }
-                NativeTraceStatus status = await EnumerateAsync(host, sourceWorkbook, attempt, cancellation).ConfigureAwait(false);
+                // Every captured target is recorded immediately, so a later failure
+                // still leaves the partial result available to the user.
+                NativeTraceStatus status = await EnumerateAsync(host, sourceWorkbook, sourceSheet, attempt, cancellation)
+                    .ConfigureAwait(false);
                 if (status != NativeTraceStatus.Succeeded)
                 {
                     attempt.Fail(status, FailureMessage(status, host.LastFailure));
@@ -215,10 +223,13 @@ namespace FormulaNavigator.Core
             }
             finally
             {
-                // Cleanup runs even after cancellation and exceptions; its own
-                // failures are recorded and downgrade the outcome afterwards.
-                if (mayRemoveArrows) await host.RemoveCreatedArrowsAsync().ConfigureAwait(false);
-                await host.RestoreStateAsync().ConfigureAwait(false);
+                if (mayRemoveArrows)
+                {
+                    try { await host.RemoveCreatedArrowsAsync().ConfigureAwait(false); }
+                    catch (Exception error) { host.RecordCleanupFailure("не удалены созданные стрелки: " + error.Message); }
+                }
+                try { await host.RestoreStateAsync().ConfigureAwait(false); }
+                catch (Exception error) { host.RecordCleanupFailure("не восстановлено состояние: " + error.Message); }
             }
             if (attempt.Status == NativeTraceStatus.Succeeded && host.CleanupFailures.Count != 0)
                 attempt.Fail(NativeTraceStatus.RestoreFailed, String.Join("; ", host.CleanupFailures.ToArray()));
@@ -226,9 +237,8 @@ namespace FormulaNavigator.Core
         }
 
         private static async Task<NativeTraceStatus> EnumerateAsync(INativeTraceHost host, string sourceWorkbook,
-            NativeTraceAttempt attempt, CancellationToken cancellation)
+            string sourceSheet, NativeTraceAttempt attempt, CancellationToken cancellation)
         {
-            var areas = new List<NativeTraceArea>();
             for (int arrow = 1; arrow <= MaxArrows; arrow++)
             {
                 cancellation.ThrowIfCancellationRequested();
@@ -238,21 +248,25 @@ namespace FormulaNavigator.Core
                     if (arrow == 1) return NativeTraceStatus.FirstArrowFailed;
                     // Confirm the trace is still healthy: the previous arrow must
                     // still navigate. If it does, a repeated failure of the current
-                    // arrow is the documented "no such arrow" condition.
+                    // arrow is the documented "no such arrow" condition. This does
+                    // not prove that a later arrow does not exist: the failure of an
+                    // existing arrow is indistinguishable from its absence, so the
+                    // completeness of the result stays unconfirmed.
                     NativeArrowStep recheck = await host.NavigateAsync(arrow - 1, null).ConfigureAwait(false);
                     if (!recheck.Captured) return NativeTraceStatus.EnumerationFailed;
                     NativeArrowStep retry = await host.NavigateAsync(arrow, null).ConfigureAwait(false);
                     if (!retry.Captured) break;
                     step = retry;
                 }
-                areas.AddRange(step.Areas);
+                attempt.AddAreas(step.Areas);
                 if (arrow == MaxArrows) return NativeTraceStatus.LimitReached;
-                // LinkNumber only applies to external-reference arrows, i.e. arrows
-                // whose captured target lies in another workbook. Same-workbook
-                // cross-sheet arrows have a single target and no links.
-                bool external = step.Areas.Any(area =>
-                    !String.Equals(area.Workbook, sourceWorkbook, StringComparison.OrdinalIgnoreCase));
-                if (!external) continue;
+                // Excel combines every target that leaves the source sheet — other
+                // sheets of the same workbook as well as other workbooks — into a
+                // single off-sheet arrow and enumerates the individual targets
+                // through LinkNumber. Same-sheet targets get their own arrows.
+                bool offSheet = step.Areas.Any(area =>
+                    !String.Equals(area.Sheet, sourceSheet, StringComparison.OrdinalIgnoreCase));
+                if (!offSheet) continue;
                 for (int link = 2; link <= MaxLinks; link++)
                 {
                     cancellation.ThrowIfCancellationRequested();
@@ -265,11 +279,10 @@ namespace FormulaNavigator.Core
                         if (!retry.Captured) break;
                         linkStep = retry;
                     }
-                    areas.AddRange(linkStep.Areas);
+                    attempt.AddAreas(linkStep.Areas);
                     if (link == MaxLinks) return NativeTraceStatus.LimitReached;
                 }
             }
-            attempt.AddAreas(areas);
             return NativeTraceStatus.Succeeded;
         }
 
@@ -299,7 +312,7 @@ namespace FormulaNavigator.Core
                     message = "Excel не построил стрелки зависимых (возможна защита листа или неподдерживаемый случай).";
                     break;
                 case NativeTraceStatus.FirstArrowFailed:
-                    message = "Штатная трассировка не смогла подтвердить ни одну стрелку: отсутствие зависимых и ошибка неразличимы.";
+                    message = "Не удалось подтвердить наличие или отсутствие зависимых: сбой первой стрелки неотличим от их отсутствия.";
                     break;
                 case NativeTraceStatus.EnumerationFailed:
                     message = "Штатная трассировка прервана ошибкой; результат был бы неполным.";
