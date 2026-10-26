@@ -30,6 +30,16 @@ namespace FormulaNavigator.Core
             _elapsedMilliseconds = elapsedMilliseconds;
         }
 
+        // Starts a new measurement for a repeated request in the same window. The
+        // window-shown mark belongs to the first request and is kept.
+        public void BeginSearch()
+        {
+            _listReady = -1;
+            _detailsDone = -1;
+            _traceMilliseconds = -1;
+            _searchMilliseconds = -1;
+        }
+
         // Called when the window is first shown, before the search starts.
         public void MarkWindowShown()
         {

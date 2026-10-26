@@ -26,8 +26,9 @@ namespace FormulaNavigator.AddIn.Excel
                 progress?.Report("Выполняю штатную трассировку Excel…");
                 NativeTraceAttempt attempt = await NativeDependentTrace.RunAsync(host, location.Workbook,
                     location.Sheet, cancellation).ConfigureAwait(false);
+                // The total request time covers the trace and the post-processing;
+                // the trace stage is reported separately.
                 long traceMilliseconds = clock.ElapsedMilliseconds;
-                clock.Restart();
 
                 // Whatever was captured before a failure is shown to the user; it is
                 // never silently dropped and never presented as confirmed.
@@ -83,35 +84,51 @@ namespace FormulaNavigator.AddIn.Excel
             return result.AsReadOnly();
         }
 
-        // Loads the deferred formulas and values one area at a time. Each area is a
-        // single batched read (one Formula2 and one Value2 call); the dispatcher
-        // yields between areas, so the window stays responsive and cancellable.
-        // Every callback is invoked on the caller's context.
+        // Loads the deferred formulas and values in bounded blocks. Every area is
+        // read in row blocks of at most 128 rows, each block is one batched COM
+        // read (Formula2 plus Value2) dispatched separately, so Excel's thread
+        // yields between blocks, cancellation is checked between them and a huge
+        // area cannot occupy the thread. Every callback returns the task that
+        // applies the batch, so the caller's completion means the data is visible.
         public async Task LoadNativeDetailsAsync(IReadOnlyList<ExcelLocation> areas,
-            Action<IReadOnlyList<DependentDetail>> onBatch, CancellationToken cancellation)
+            Func<IReadOnlyList<DependentDetail>, Task> onBatch, CancellationToken cancellation)
         {
             if (onBatch == null) throw new ArgumentNullException("onBatch");
             if (areas == null) return;
             var workbookCache = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            int remaining = NativeDependentTrace.MaxCells;
             foreach (ExcelLocation area in areas)
             {
-                cancellation.ThrowIfCancellationRequested();
-                List<DependentDetail> batch = await OnExcelThread(() => ReadAreaDetails(area, workbookCache))
-                    .ConfigureAwait(false);
-                if (batch.Count > 0) onBatch(batch);
+                ReferenceArea parsed;
+                if (!ReferenceParser.TryParse(NativeDependentTrace.NormalizeAddress(area.Address), area.Workbook,
+                    area.Sheet, out parsed))
+                    continue;
+                for (int startRow = parsed.StartRow; startRow <= parsed.EndRow; startRow += DetailBlockRows)
+                {
+                    cancellation.ThrowIfCancellationRequested();
+                    int endRow = Math.Min(startRow + DetailBlockRows - 1, parsed.EndRow);
+                    int blockCells = (endRow - startRow + 1) * (parsed.EndColumn - parsed.StartColumn + 1);
+                    if (blockCells > remaining) endRow = Math.Min(endRow,
+                        startRow + Math.Max(remaining / (parsed.EndColumn - parsed.StartColumn + 1), 1) - 1);
+                    if (endRow < startRow) break;
+                    remaining -= (endRow - startRow + 1) * (parsed.EndColumn - parsed.StartColumn + 1);
+                    if (remaining < 0) remaining = 0;
+                    int from = startRow, to = endRow;
+                    List<DependentDetail> batch = await OnExcelThread(
+                        () => ReadAreaDetails(area, parsed, from, to, workbookCache)).ConfigureAwait(false);
+                    if (batch.Count > 0) await onBatch(batch).ConfigureAwait(false);
+                    if (remaining == 0) return;
+                }
             }
         }
 
-        private List<DependentDetail> ReadAreaDetails(ExcelLocation area, Dictionary<string, object> workbookCache)
+        private const int DetailBlockRows = 128;
+
+        private List<DependentDetail> ReadAreaDetails(ExcelLocation area, ReferenceArea parsed, int startRow, int endRow,
+            Dictionary<string, object> workbookCache)
         {
             EnsureExcelThread();
             var batch = new List<DependentDetail>();
-            // The area bounds come from the already parsed address, not from four
-            // extra COM reads of Row/Column/Rows.Count/Columns.Count.
-            ReferenceArea parsed;
-            if (!ReferenceParser.TryParse(NativeDependentTrace.NormalizeAddress(area.Address), area.Workbook,
-                area.Sheet, out parsed))
-                return batch;
             try
             {
                 dynamic workbook;
@@ -125,38 +142,40 @@ namespace FormulaNavigator.AddIn.Excel
                     workbook = FindOpenWorkbook(area.Workbook);
                     workbookCache[area.Workbook] = workbook;
                 }
-                if (workbook == null)
-                {
-                    batch.Add(new DependentDetail(new ExcelLocation(area.Workbook, area.Sheet,
-                        NativeDependentTrace.NormalizeAddress(area.Address)),
-                        "не прочитано: книга не открыта", String.Empty));
-                    return batch;
-                }
+                if (workbook == null) throw new InvalidOperationException("книга не открыта");
                 dynamic sheet = workbook.Worksheets[area.Sheet];
-                dynamic range = sheet.Range[NativeDependentTrace.NormalizeAddress(area.Address)];
+                string blockAddress = ColumnName(parsed.StartColumn) + startRow.ToString(CultureInfo.InvariantCulture)
+                    + ":" + ColumnName(parsed.EndColumn) + endRow.ToString(CultureInfo.InvariantCulture);
+                dynamic range = sheet.Range[blockAddress];
                 object formulas = ReadFormulas(range);
                 object values;
                 try { values = range.Value2; }
                 catch (Exception) { values = null; }
-                for (int row = parsed.StartRow; row <= parsed.EndRow; row++)
+                for (int row = startRow; row <= endRow; row++)
                 {
                     for (int column = parsed.StartColumn; column <= parsed.EndColumn; column++)
                     {
                         string address = ColumnName(column) + row.ToString(CultureInfo.InvariantCulture);
                         var cellLocation = new ExcelLocation(area.Workbook, area.Sheet, address);
-                        string formula = Convert.ToString(ArrayCell(formulas, row - parsed.StartRow,
-                            column - parsed.StartColumn), CultureInfo.InvariantCulture) ?? String.Empty;
-                        object value = ArrayCell(values, row - parsed.StartRow, column - parsed.StartColumn);
+                        string formula = Convert.ToString(ArrayCell(formulas, row - startRow, column - parsed.StartColumn),
+                            CultureInfo.InvariantCulture) ?? String.Empty;
+                        object value = ArrayCell(values, row - startRow, column - parsed.StartColumn);
                         batch.Add(new DependentDetail(cellLocation, formula, DisplayValue(value)));
                     }
                 }
             }
             catch (Exception error)
             {
-                // The reason is reported as it happened; nothing is guessed.
-                batch.Add(new DependentDetail(new ExcelLocation(area.Workbook, area.Sheet,
-                    NativeDependentTrace.NormalizeAddress(area.Address)),
-                    "не прочитано: " + ComMessage(error), String.Empty));
+                // The reason is reported per cell as it happened; nothing is guessed.
+                for (int row = startRow; row <= endRow; row++)
+                {
+                    for (int column = parsed.StartColumn; column <= parsed.EndColumn; column++)
+                    {
+                        string address = ColumnName(column) + row.ToString(CultureInfo.InvariantCulture);
+                        batch.Add(new DependentDetail(new ExcelLocation(area.Workbook, area.Sheet, address),
+                            "не прочитано: " + ComMessage(error), String.Empty));
+                    }
+                }
             }
             return batch;
         }

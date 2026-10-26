@@ -70,13 +70,13 @@ namespace FormulaNavigator.AddIn
             MenuName = MenuName, MenuText = "Зависимые ячейки (Ctrl+Shift+Q)")]
         public static void FindDependents()
         {
+            // The clock starts before any work, including readiness checks, so the
+            // measurements cover the full time from the keystroke to the ready window.
+            var timing = new QueryTiming();
             try
             {
                 EnsureReady();
                 if (ActivateOpenDialog()) return;
-                // The clock starts before the first COM call, so the measurements
-                // cover the full time from the keystroke to the ready window.
-                var timing = new QueryTiming();
                 var context = gateway.CaptureActiveCell();
                 bool first = ++dependentQueryCount == 1;
                 var window = new DependentsWindow(gateway, context, OpenLocation, timing, first);

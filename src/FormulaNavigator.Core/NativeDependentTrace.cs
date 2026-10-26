@@ -190,36 +190,45 @@ namespace FormulaNavigator.Core
             // cleanup runs even when a previous step failed, so a late error can
             // never skip the state restoration.
             bool mayRemoveArrows = false;
+            NativeTraceStatus? failure = null;
             try
             {
                 UserArrowCheck check = await host.CheckUserArrowsAsync().ConfigureAwait(false);
                 if (check == UserArrowCheck.CheckFailed)
                 {
-                    attempt.Fail(NativeTraceStatus.UserArrowCheckFailed, host.LastFailure);
-                    return attempt;
+                    failure = NativeTraceStatus.UserArrowCheckFailed;
                 }
-                if (check == UserArrowCheck.Exists)
+                else if (check == UserArrowCheck.Exists)
                 {
-                    attempt.Fail(NativeTraceStatus.ExistingUserArrows,
-                        "У исходной ячейки уже есть пользовательские стрелки зависимых; штатная трассировка отменена, чтобы не удалить их.");
-                    return attempt;
+                    failure = NativeTraceStatus.ExistingUserArrows;
                 }
-                mayRemoveArrows = true;
-                if (!await host.TryCreateArrowsAsync().ConfigureAwait(false))
+                else
                 {
-                    attempt.Fail(NativeTraceStatus.ShowDependentsFailed, host.LastFailure);
-                    return attempt;
+                    mayRemoveArrows = true;
+                    if (!await host.TryCreateArrowsAsync().ConfigureAwait(false))
+                    {
+                        failure = NativeTraceStatus.ShowDependentsFailed;
+                    }
+                    else
+                    {
+                        // Every captured target is recorded immediately, so a later
+                        // failure still leaves the partial result available to the
+                        // user. A host exception must not lose them either: it is
+                        // classified as a broken enumeration, not rethrown.
+                        try
+                        {
+                            NativeTraceStatus status = await EnumerateAsync(host, sourceWorkbook, sourceSheet,
+                                attempt, cancellation).ConfigureAwait(false);
+                            if (status != NativeTraceStatus.Succeeded) failure = status;
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception error)
+                        {
+                            host.RecordCleanupFailure("перечисление прервано: " + error.Message);
+                            failure = NativeTraceStatus.EnumerationFailed;
+                        }
+                    }
                 }
-                // Every captured target is recorded immediately, so a later failure
-                // still leaves the partial result available to the user.
-                NativeTraceStatus status = await EnumerateAsync(host, sourceWorkbook, sourceSheet, attempt, cancellation)
-                    .ConfigureAwait(false);
-                if (status != NativeTraceStatus.Succeeded)
-                {
-                    attempt.Fail(status, FailureMessage(status, host.LastFailure));
-                    return attempt;
-                }
-                attempt.Succeed();
             }
             finally
             {
@@ -231,8 +240,20 @@ namespace FormulaNavigator.Core
                 try { await host.RestoreStateAsync().ConfigureAwait(false); }
                 catch (Exception error) { host.RecordCleanupFailure("не восстановлено состояние: " + error.Message); }
             }
-            if (attempt.Status == NativeTraceStatus.Succeeded && host.CleanupFailures.Count != 0)
-                attempt.Fail(NativeTraceStatus.RestoreFailed, String.Join("; ", host.CleanupFailures.ToArray()));
+            // The outcome is applied only after the cleanup, so a restore failure
+            // is reported even when the trace itself already failed.
+            if (failure.HasValue)
+                attempt.Fail(failure.Value, FailureMessage(failure.Value, host.LastFailure));
+            else
+                attempt.Succeed();
+            if (host.CleanupFailures.Count != 0)
+            {
+                string cleanup = String.Join("; ", host.CleanupFailures.ToArray());
+                if (attempt.Status == NativeTraceStatus.Succeeded)
+                    attempt.Fail(NativeTraceStatus.RestoreFailed, cleanup);
+                else
+                    attempt.Fail(attempt.Status, attempt.Failure + " " + cleanup);
+            }
             return attempt;
         }
 

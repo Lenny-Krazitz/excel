@@ -836,6 +836,21 @@ namespace FormulaNavigator.Core.Tests
             // A broken enumeration still keeps everything captured so far: the
             // partial result is shown with a warning, never discarded.
             AssertEqual(1, attempt.Areas.Count, "a partial result must be preserved after a failure");
+
+            // A host exception during enumeration is classified as a broken trace;
+            // the captured partial result survives and the cleanup still runs.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                throw new InvalidOperationException("сбой COM");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status,
+                "a host exception must not lose the partial result");
+            AssertEqual(1, attempt.Areas.Count, "the captured target must survive a host exception");
+            Assert(host.RemoveArrowsCalled, "created arrows must still be removed");
+            Assert(host.RestoreCalled, "the state must still be restored");
         }
 
         private static void NativeTraceCleanupAndRestore()
@@ -882,6 +897,16 @@ namespace FormulaNavigator.Core.Tests
             AssertEqual(NativeTraceStatus.RestoreFailed, attempt.Status, "cleanup failures must downgrade the result");
             AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
                 "a result with failed cleanup must not be used");
+
+            // A cleanup failure is reported even when the trace itself already
+            // failed: the outcome is applied only after the cleanup.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate { return NativeArrowStep.FailedStep("error"); };
+            host.CleanupFailuresList.Add("не восстановлено состояние");
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.FirstArrowFailed, attempt.Status, "the trace status must be kept");
+            Assert(attempt.Failure.Contains("не восстановлено состояние"),
+                "cleanup failures must be reported for a failed trace");
 
             // The restore stack runs steps in reverse order, attempts every step
             // even after failures and records the failed ones.
@@ -942,6 +967,21 @@ namespace FormulaNavigator.Core.Tests
             timing.MarkWindowShown();
             AssertEqual("окно 10 мс", timing.Describe(), "unmeasured stages must be omitted");
             AssertEqual("", timing.SearchSeconds(), "an unmeasured search must not be reported");
+
+            // A repeated request in the same window restarts the stage marks but
+            // keeps the window-shown mark of the first request.
+            long repeated = 0;
+            timing = new QueryTiming(delegate { return repeated; });
+            repeated = 10;
+            timing.MarkWindowShown();
+            repeated = 25;
+            timing.MarkListReady();
+            timing.BeginSearch();
+            AssertEqual("окно 10 мс", timing.Describe(), "a repeated search must restart the stage marks");
+            repeated = 40;
+            timing.MarkListReady();
+            AssertEqual("окно 10 мс · список 40 мс", timing.Describe(),
+                "a repeated search must measure its own stages");
         }
 
         private static void RestoreStackHostOrder()
