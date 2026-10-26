@@ -17,6 +17,7 @@ namespace FormulaNavigator.AddIn
         private static DependentsWindow dependents;
         private static bool keysRegistered;
         private static bool shuttingDown;
+        private static int dependentQueryCount;
 
         public void AutoOpen()
         {
@@ -73,8 +74,12 @@ namespace FormulaNavigator.AddIn
             {
                 EnsureReady();
                 if (ActivateOpenDialog()) return;
+                // The clock starts before the first COM call, so the measurements
+                // cover the full time from the keystroke to the ready window.
+                var timing = new QueryTiming();
                 var context = gateway.CaptureActiveCell();
-                var window = new DependentsWindow(gateway, context, OpenLocation);
+                bool first = ++dependentQueryCount == 1;
+                var window = new DependentsWindow(gateway, context, OpenLocation, timing, first);
                 dependents = window;
                 window.Closed += (sender, args) => { if (ReferenceEquals(dependents, window)) dependents = null; };
                 try

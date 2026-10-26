@@ -46,6 +46,8 @@ namespace FormulaNavigator.Core.Tests
             Run("native trace enumeration sequences", NativeTraceEnumerationSequences);
             Run("native trace cleanup and restore", NativeTraceCleanupAndRestore);
             Run("native trace cancellation and unexpected errors", NativeTraceCancellationAndErrors);
+            Run("query timing stages", QueryTimingStages);
+            Run("restore stack host order", RestoreStackHostOrder);
             Run("add-in command bindings", AddInCommandBindings);
             Console.WriteLine(_failures == 0 ? "All FormulaNavigator.Core tests passed." : _failures + " test(s) failed.");
             return _failures == 0 ? 0 : 1;
@@ -610,6 +612,11 @@ namespace FormulaNavigator.Core.Tests
             public IReadOnlyList<string> CleanupFailures { get { return CleanupFailuresList; } }
             public string LastFailure { get; set; }
 
+            public void RecordCleanupFailure(string message)
+            {
+                CleanupFailuresList.Add(message);
+            }
+
             public Task<bool> TrySaveStateAsync()
             {
                 Calls.Add("save");
@@ -729,23 +736,39 @@ namespace FormulaNavigator.Core.Tests
                 if (arrow == 2) return Step(Area("Book.xlsx", "Sheet1", "C3"));
                 return NativeArrowStep.FailedStep("нет стрелки");
             };
-            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a complete enumeration must succeed");
             AssertEqual(2, attempt.Areas.Count, "both arrows must be captured");
             Assert(host.RemoveArrowsCalled, "created arrows must be removed");
             Assert(host.RestoreCalled, "state must be restored");
 
-            // Cross-sheet dependents inside the same workbook need no link iteration.
+            // Off-sheet dependents — another sheet of the same workbook — are
+            // combined by Excel into a single arrow; the individual targets are
+            // enumerated through LinkNumber. The source sheet is Sheet1, so the
+            // Sheet2 target makes the arrow off-sheet and its links are probed.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
                 if (arrow == 1 && !link.HasValue) return Step(Area("Book.xlsx", "Sheet2", "A1"));
-                if (link.HasValue) throw new InvalidOperationException("same-workbook arrows have no links");
+                if (arrow == 1 && link == 2) return Step(Area("Book.xlsx", "Sheet2", "B2"));
                 return NativeArrowStep.FailedStep("end");
             };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "cross-sheet arrows must succeed without links");
-            AssertEqual(1, attempt.Areas.Count, "the cross-sheet target must be captured");
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "off-sheet targets must be enumerated through links");
+            AssertEqual(2, attempt.Areas.Count, "both off-sheet targets must be captured");
+
+            // Same-sheet targets keep their own arrows and never probe links: the
+            // fake host fails every link request, which would break enumeration.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate(int arrow, int? link)
+            {
+                if (link.HasValue) throw new InvalidOperationException("same-sheet arrows have no links");
+                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                return NativeArrowStep.FailedStep("end");
+            };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "same-sheet arrows must not probe links");
+            AssertEqual(1, attempt.Areas.Count, "the same-sheet target must be captured");
 
             // An external arrow: every link is enumerated and duplicates merge.
             host = new FakeTraceHost();
@@ -755,7 +778,7 @@ namespace FormulaNavigator.Core.Tests
                 if (arrow == 1 && link == 2) return Step(Area("Book.xlsx", "Sheet1", "D4"), Area("Other.xlsx", "Sheet1", "$A$1"));
                 return NativeArrowStep.FailedStep("end");
             };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "external links must be enumerated");
             // The enumerator keeps raw captures; deduplication happens when the
             // gateway merges the areas.
@@ -779,7 +802,7 @@ namespace FormulaNavigator.Core.Tests
                 }
                 return NativeArrowStep.FailedStep("end");
             };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a transient failure must be retried");
             AssertEqual(2, attempt.Areas.Count, "both arrows must be captured after the retry");
 
@@ -787,7 +810,7 @@ namespace FormulaNavigator.Core.Tests
             // are indistinguishable, so the reverse index must be used.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate { return NativeArrowStep.FailedStep("error"); };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.FirstArrowFailed, attempt.Status, "the first arrow failure is inconclusive");
             AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
                 "an inconclusive trace must fall back to the index");
@@ -807,9 +830,12 @@ namespace FormulaNavigator.Core.Tests
                 }
                 return NativeArrowStep.FailedStep("error");
             };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status,
                 "an unhealthy trace must not be reported as complete");
+            // A broken enumeration still keeps everything captured so far: the
+            // partial result is shown with a warning, never discarded.
+            AssertEqual(1, attempt.Areas.Count, "a partial result must be preserved after a failure");
         }
 
         private static void NativeTraceCleanupAndRestore()
@@ -817,7 +843,7 @@ namespace FormulaNavigator.Core.Tests
             // Existing user arrows abort the trace before anything is created; the
             // arrows are never removed and nothing is ever created.
             var host = new FakeTraceHost { ArrowCheck = UserArrowCheck.Exists };
-            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.ExistingUserArrows, attempt.Status, "user arrows must abort the trace");
             Assert(!host.RemoveArrowsCalled, "user arrows must never be removed");
             Assert(!host.Calls.Contains("create"), "arrows must not be created");
@@ -825,20 +851,20 @@ namespace FormulaNavigator.Core.Tests
 
             // A failed state snapshot aborts before any change is made.
             host = new FakeTraceHost { SaveStateResult = false, LastFailure = "нет доступа" };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.SetupFailed, attempt.Status, "a failed snapshot must abort the trace");
             Assert(!host.Calls.Contains("check"), "nothing may be changed after a failed snapshot");
 
             // A failed user-arrow check aborts without touching arrows.
             host = new FakeTraceHost { ArrowCheck = UserArrowCheck.CheckFailed };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.UserArrowCheckFailed, attempt.Status, "an ambiguous check must abort");
             Assert(!host.RemoveArrowsCalled, "arrows must not be removed after an ambiguous check");
 
             // A ShowDependents failure still removes possibly created arrows and
             // restores the state.
             host = new FakeTraceHost { CreateArrowsResult = false };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.ShowDependentsFailed, attempt.Status, "an arrow failure must abort");
             Assert(host.RemoveArrowsCalled, "possibly created arrows must still be removed");
             Assert(host.RestoreCalled, "state must be restored after a failure");
@@ -852,7 +878,7 @@ namespace FormulaNavigator.Core.Tests
                     : NativeArrowStep.FailedStep("end");
             };
             host.CleanupFailuresList.Add("не удалены созданные стрелки");
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Result;
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.RestoreFailed, attempt.Status, "cleanup failures must downgrade the result");
             AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
                 "a result with failed cleanup must not be used");
@@ -879,7 +905,7 @@ namespace FormulaNavigator.Core.Tests
             host.NavigateImpl = delegate { throw new OperationCanceledException(); };
             try
             {
-                NativeDependentTrace.RunAsync(host, "Book.xlsx", CancellationToken.None).Wait();
+                NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Wait();
                 Assert(false, "cancellation must propagate");
             }
             catch (AggregateException aggregate)
@@ -888,6 +914,53 @@ namespace FormulaNavigator.Core.Tests
             }
             Assert(host.RemoveArrowsCalled, "created arrows must be removed after cancellation");
             Assert(host.RestoreCalled, "state must be restored after cancellation");
+        }
+
+        private static void QueryTimingStages()
+        {
+            // A fake clock makes the stage description deterministic: the window
+            // is shown at 40 ms, the trace takes 120 ms, the list is ready at
+            // 190 ms and the deferred details finish at 700 ms.
+            long clock = 0;
+            var timing = new QueryTiming(delegate { return clock; });
+            clock = 40;
+            timing.MarkWindowShown();
+            clock = 160;
+            timing.RecordTrace(120);
+            timing.RecordSearch(150);
+            clock = 190;
+            timing.MarkListReady();
+            clock = 700;
+            timing.MarkDetailsDone();
+            AssertEqual("окно 40 мс · трассировка 120 мс · список 190 мс · детали 700 мс", timing.Describe(),
+                "every measured stage must be reported");
+            AssertEqual("0.15", timing.SearchSeconds(), "the search duration must be reported in seconds");
+
+            // Missing marks and negative measurements are omitted, so a partial
+            // timing never claims a stage it did not measure.
+            timing = new QueryTiming(delegate { return 10; });
+            timing.MarkWindowShown();
+            AssertEqual("окно 10 мс", timing.Describe(), "unmeasured stages must be omitted");
+            AssertEqual("", timing.SearchSeconds(), "an unmeasured search must not be reported");
+        }
+
+        private static void RestoreStackHostOrder()
+        {
+            // The trace host pushes the Excel state steps in this order and the
+            // stack must replay them in reverse, so the workbook is reactivated
+            // first and the cheap rendering flags come last.
+            var order = new List<string>();
+            var stack = new StateRestoreStack();
+            stack.Push("screenUpdating", delegate { order.Add("screenUpdating"); });
+            stack.Push("events", delegate { order.Add("events"); });
+            stack.Push("alerts", delegate { order.Add("alerts"); });
+            stack.Push("activeCell", delegate { order.Add("activeCell"); });
+            stack.Push("selection", delegate { order.Add("selection"); });
+            stack.Push("sheet", delegate { order.Add("sheet"); });
+            stack.Push("workbook", delegate { order.Add("workbook"); });
+            stack.RestoreAll();
+            AssertEqual("workbook,sheet,selection,activeCell,alerts,events,screenUpdating", string.Join(",", order),
+                "the host state must be restored in reverse push order");
         }
 
         private static void AddInCommandBindings()

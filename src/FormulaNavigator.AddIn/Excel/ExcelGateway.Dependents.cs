@@ -14,23 +14,15 @@ namespace FormulaNavigator.AddIn.Excel
         private static readonly ResolvedDependencies EmptyResolvedDependencies =
             new ResolvedDependencies(new DependencyRangeIndex(new IndexedDependency[0]), new string[0]);
 
-        // Ctrl+Shift+Q entry point. The built-in Excel tracer search runs first;
-        // the reverse index is the automatic fallback for every case the tracer
-        // cannot confirm. forceRefresh only affects the fallback: a successful
-        // native search is always current, so it is never rebuilt.
+        // Ctrl+Shift+Q entry point. The direct dependents come entirely from the
+        // built-in Excel trace; the reverse index is not consulted for this
+        // request. When the trace cannot confirm its result, the captured partial
+        // result is returned with a warning instead of a silent index fallback.
         public async Task<DependencyResult> FindDependentsAsync(ExcelLocation location, CancellationToken cancellation,
-            IProgress<string> progress, bool forceRefresh = false)
+            IProgress<string> progress)
         {
             if (location == null) throw new ArgumentNullException(nameof(location));
-            NativeSearchOutcome native = await TryFindNativeDependentsAsync(location, cancellation, progress)
-                .ConfigureAwait(false);
-            if (native.Result != null) return native.Result;
-            DependencyResult indexed = await FindIndexDependentsAsync(location, cancellation, progress, forceRefresh)
-                .ConfigureAwait(false);
-            if (String.IsNullOrEmpty(native.Warning)) return indexed;
-            var warnings = new List<string>(indexed.Warnings) { native.Warning };
-            return new DependencyResult(indexed.Cells, warnings.AsReadOnly(), indexed.FormulaCount,
-                indexed.IndexReused, indexed.ElapsedMilliseconds);
+            return await TryFindNativeDependentsAsync(location, cancellation, progress).ConfigureAwait(false);
         }
 
         private async Task<DependencyResult> FindIndexDependentsAsync(ExcelLocation location, CancellationToken cancellation,

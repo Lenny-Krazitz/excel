@@ -71,10 +71,26 @@ namespace FormulaNavigator.AddIn.Excel
         public string Note { get; private set; }
     }
 
+    public sealed class DependentDetail
+    {
+        public DependentDetail(ExcelLocation location, string formula, string displayValue)
+        {
+            if (location == null) throw new ArgumentNullException("location");
+            Location = location;
+            Formula = formula ?? String.Empty;
+            DisplayValue = displayValue ?? String.Empty;
+        }
+
+        public ExcelLocation Location { get; private set; }
+        public string Formula { get; private set; }
+        public string DisplayValue { get; private set; }
+    }
+
     public sealed class DependencyResult
     {
         public DependencyResult(IReadOnlyList<DependentCell> cells, IReadOnlyList<string> warnings, int formulaCount,
-            bool indexReused = false, long elapsedMilliseconds = 0, bool fromNativeTrace = false)
+            bool indexReused = false, long elapsedMilliseconds = 0, bool fromNativeTrace = false,
+            long traceMilliseconds = -1, IReadOnlyList<ExcelLocation> detailAreas = null)
         {
             Cells = cells ?? new List<DependentCell>().AsReadOnly();
             Warnings = warnings ?? new List<string>().AsReadOnly();
@@ -82,6 +98,8 @@ namespace FormulaNavigator.AddIn.Excel
             IndexReused = indexReused;
             ElapsedMilliseconds = elapsedMilliseconds;
             FromNativeTrace = fromNativeTrace;
+            TraceMilliseconds = traceMilliseconds;
+            DetailAreas = detailAreas ?? new List<ExcelLocation>().AsReadOnly();
         }
 
         public IReadOnlyList<DependentCell> Cells { get; private set; }
@@ -92,5 +110,9 @@ namespace FormulaNavigator.AddIn.Excel
         // True when the result comes from the built-in Excel tracer search rather
         // than the reverse index.
         public bool FromNativeTrace { get; private set; }
+        // Duration of the tracer stage itself, for the stage breakdown in the UI.
+        public long TraceMilliseconds { get; private set; }
+        // Areas whose formulas and values are loaded after the list is shown.
+        public IReadOnlyList<ExcelLocation> DetailAreas { get; private set; }
     }
 }
