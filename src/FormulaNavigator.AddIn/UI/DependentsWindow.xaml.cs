@@ -153,7 +153,7 @@ namespace FormulaNavigator.AddIn.UI
                     if (!closing && search != null && !cancellation.IsCancellationRequested)
                         StatusLabel.Text = text;
                 });
-                DependencyResult result = await gateway.FindDependentsAsync(origin.Location, cancellation.Token, progress);
+                DependencyResult result = await gateway.FindDependentsAsync(origin.Location, cancellation, progress);
                 if (closing) return;
                 cells.AddRange(result.Cells);
                 timing.RecordTrace(result.TraceMilliseconds);
