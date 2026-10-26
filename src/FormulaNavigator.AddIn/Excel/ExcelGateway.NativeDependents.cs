@@ -360,7 +360,8 @@ namespace FormulaNavigator.AddIn.Excel
                         .ToList();
                     if (filtered.Count == 0) return NativeArrowStep.FailedStep("навигация не покинула исходную ячейку");
                     _leftSourceSheet = filtered.Any(area =>
-                        !String.Equals(area.Sheet, _source.Sheet, StringComparison.OrdinalIgnoreCase));
+                        !String.Equals(area.Sheet, _source.Sheet, StringComparison.OrdinalIgnoreCase) ||
+                        !String.Equals(area.Workbook, _source.Workbook, StringComparison.OrdinalIgnoreCase));
                     return NativeArrowStep.CapturedStep(filtered);
                 }
                 catch (Exception error)

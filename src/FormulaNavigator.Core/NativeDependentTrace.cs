@@ -261,11 +261,13 @@ namespace FormulaNavigator.Core
                 attempt.AddAreas(step.Areas);
                 if (arrow == MaxArrows) return NativeTraceStatus.LimitReached;
                 // Excel combines every target that leaves the source sheet — other
-                // sheets of the same workbook as well as other workbooks — into a
-                // single off-sheet arrow and enumerates the individual targets
-                // through LinkNumber. Same-sheet targets get their own arrows.
+                // sheets of the same workbook as well as other workbooks, even when
+                // the target sheet carries the same name — into a single off-sheet
+                // arrow and enumerates the individual targets through LinkNumber.
+                // Same-sheet targets get their own arrows.
                 bool offSheet = step.Areas.Any(area =>
-                    !String.Equals(area.Sheet, sourceSheet, StringComparison.OrdinalIgnoreCase));
+                    !String.Equals(area.Sheet, sourceSheet, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(area.Workbook, sourceWorkbook, StringComparison.OrdinalIgnoreCase));
                 if (!offSheet) continue;
                 for (int link = 2; link <= MaxLinks; link++)
                 {
