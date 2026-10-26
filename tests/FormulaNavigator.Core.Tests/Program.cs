@@ -612,6 +612,11 @@ namespace FormulaNavigator.Core.Tests
             public IReadOnlyList<string> CleanupFailures { get { return CleanupFailuresList; } }
             public string LastFailure { get; set; }
 
+            public void RecordCleanupFailure(string message)
+            {
+                CleanupFailuresList.Add(message);
+            }
+
             public Task<bool> TrySaveStateAsync()
             {
                 Calls.Add("save");
