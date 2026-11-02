@@ -79,7 +79,10 @@ namespace FormulaNavigator.AddIn
                 if (ActivateOpenDialog()) return;
                 var context = gateway.CaptureActiveCell();
                 bool first = ++dependentQueryCount == 1;
-                var window = new DependentsWindow(gateway, context, OpenLocation, timing, first);
+                // The built-in trace runs here, in the command's macro context on
+                // Excel's thread, before the window exists.
+                DependencyResult result = gateway.TraceDependents(context.Location);
+                var window = new DependentsWindow(gateway, context, OpenLocation, timing, first, result);
                 dependents = window;
                 window.Closed += (sender, args) => { if (ReferenceEquals(dependents, window)) dependents = null; };
                 try

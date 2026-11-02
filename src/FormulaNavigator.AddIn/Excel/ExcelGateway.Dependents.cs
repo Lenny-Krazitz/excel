@@ -14,17 +14,6 @@ namespace FormulaNavigator.AddIn.Excel
         private static readonly ResolvedDependencies EmptyResolvedDependencies =
             new ResolvedDependencies(new DependencyRangeIndex(new IndexedDependency[0]), new string[0]);
 
-        // Ctrl+Shift+Q entry point. The direct dependents come entirely from the
-        // built-in Excel trace; the reverse index is not consulted for this
-        // request. When the trace cannot confirm its result, the captured partial
-        // result is returned with a warning instead of a silent index fallback.
-        public async Task<DependencyResult> FindDependentsAsync(ExcelLocation location, CancellationToken cancellation,
-            IProgress<string> progress)
-        {
-            if (location == null) throw new ArgumentNullException(nameof(location));
-            return await TryFindNativeDependentsAsync(location, cancellation, progress).ConfigureAwait(false);
-        }
-
         private async Task<DependencyResult> FindIndexDependentsAsync(ExcelLocation location, CancellationToken cancellation,
             IProgress<string> progress, bool forceRefresh)
         {

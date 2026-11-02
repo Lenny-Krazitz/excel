@@ -11,173 +11,128 @@ namespace FormulaNavigator.AddIn.Excel
 {
     public sealed partial class ExcelGateway
     {
-        // Ctrl+Shift+Q entry: the direct dependents come entirely from the built-in
-        // Excel trace. The reverse index is not used for this request; when the
-        // trace cannot confirm its result, the captured partial result is shown
-        // together with a warning instead of a silent fallback.
-        private async Task<DependencyResult> TryFindNativeDependentsAsync(ExcelLocation location,
-            CancellationToken cancellation, IProgress<string> progress)
-        {
-            var clock = Stopwatch.StartNew();
-            var host = new ExcelNativeTraceHost(this, location);
-            Interlocked.Increment(ref _nativeTraceActive);
-            try
-            {
-                progress?.Report("Выполняю штатную трассировку Excel…");
-                NativeTraceAttempt attempt = await NativeDependentTrace.RunAsync(host, location.Workbook,
-                    location.Sheet, cancellation).ConfigureAwait(false);
-                // The total request time covers the trace and the post-processing;
-                // the trace stage is reported separately.
-                long traceMilliseconds = clock.ElapsedMilliseconds;
-
-                // Whatever was captured before a failure is shown to the user; it is
-                // never silently dropped and never presented as confirmed.
-                IReadOnlyList<NativeTraceArea> merged = NativeDependentTrace.MergeAreas(attempt.Areas);
-                IReadOnlyList<NativeTraceCell> cells;
-                var warnings = new List<string>();
-                bool withinBudget = NativeDependentTrace.TryExpandCells(merged, NativeDependentTrace.MaxCells, out cells);
-                if (!withinBudget)
-                    warnings.Add("Результат усечён до " + NativeDependentTrace.MaxCells
-                        + " ячеек: штатная трассировка вернула слишком большой диапазон.");
-                if (attempt.Status != NativeTraceStatus.Succeeded)
-                    warnings.Add(NativeDependentTrace.Decide(attempt).Warning);
-                else
-                    warnings.Add("Полнота результата не подтверждена: конец перечисления стрелок определяется "
-                        + "по сбою NavigateArrow, который не отличает конец перечисления от сбоя существующей стрелки.");
-
-                IReadOnlyList<ExcelLocation> detailAreas = BuildDetailAreas(merged);
-                IReadOnlyList<DependentCell> placeholders = BuildPlaceholderCells(cells);
-                clock.Stop();
-                return new DependencyResult(placeholders, warnings.AsReadOnly(), placeholders.Count, false,
-                    clock.ElapsedMilliseconds, true, traceMilliseconds, detailAreas);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception error)
-            {
-                return new DependencyResult(new List<DependentCell>().AsReadOnly(),
-                    new List<string> { "Штатная трассировка прервана ошибкой: " + ComMessage(error) + "." }.AsReadOnly(),
-                    0, false, clock.ElapsedMilliseconds, true, -1, null);
-            }
-            finally
-            {
-                Interlocked.Decrement(ref _nativeTraceActive);
-            }
-        }
-
-        private static IReadOnlyList<ExcelLocation> BuildDetailAreas(IReadOnlyList<NativeTraceArea> areas)
-        {
-            var result = new List<ExcelLocation>();
-            foreach (NativeTraceArea area in areas)
-                result.Add(new ExcelLocation(area.Workbook, area.Sheet, NativeDependentTrace.NormalizeAddress(area.Address)));
-            return result.AsReadOnly();
-        }
-
-        // The list is shown before the formulas and values are known, so every cell
-        // first appears with an empty formula; the details task fills them in.
-        private static IReadOnlyList<DependentCell> BuildPlaceholderCells(IReadOnlyList<NativeTraceCell> cells)
-        {
-            var result = new List<DependentCell>();
-            foreach (NativeTraceCell cell in NativeDependentTrace.OrderCells(cells))
-                result.Add(new DependentCell(new InspectionContext(
-                    new ExcelLocation(cell.Workbook, cell.Sheet, cell.Address), String.Empty, String.Empty, false),
-                    String.Empty));
-            return result.AsReadOnly();
-        }
-
-        // Loads the deferred formulas and values in bounded blocks. Every area is
-        // read in row blocks of at most 128 rows, each block is one batched COM
-        // read (Formula2 plus Value2) dispatched separately, so Excel's thread
-        // yields between blocks, cancellation is checked between them and a huge
-        // area cannot occupy the thread. Every callback returns the task that
-        // applies the batch, so the caller's completion means the data is visible.
-        public async Task LoadNativeDetailsAsync(IReadOnlyList<ExcelLocation> areas,
-            Func<IReadOnlyList<DependentDetail>, Task> onBatch, CancellationToken cancellation)
-        {
-            if (onBatch == null) throw new ArgumentNullException("onBatch");
-            if (areas == null) return;
-            var workbookCache = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-            int remaining = NativeDependentTrace.MaxCells;
-            foreach (ExcelLocation area in areas)
-            {
-                ReferenceArea parsed;
-                if (!ReferenceParser.TryParse(NativeDependentTrace.NormalizeAddress(area.Address), area.Workbook,
-                    area.Sheet, out parsed))
-                    continue;
-                for (int startRow = parsed.StartRow; startRow <= parsed.EndRow; startRow += DetailBlockRows)
-                {
-                    cancellation.ThrowIfCancellationRequested();
-                    int endRow = Math.Min(startRow + DetailBlockRows - 1, parsed.EndRow);
-                    int blockCells = (endRow - startRow + 1) * (parsed.EndColumn - parsed.StartColumn + 1);
-                    if (blockCells > remaining) endRow = Math.Min(endRow,
-                        startRow + Math.Max(remaining / (parsed.EndColumn - parsed.StartColumn + 1), 1) - 1);
-                    if (endRow < startRow) break;
-                    remaining -= (endRow - startRow + 1) * (parsed.EndColumn - parsed.StartColumn + 1);
-                    if (remaining < 0) remaining = 0;
-                    int from = startRow, to = endRow;
-                    List<DependentDetail> batch = await OnExcelThread(
-                        () => ReadAreaDetails(area, parsed, from, to, workbookCache)).ConfigureAwait(false);
-                    if (batch.Count > 0) await onBatch(batch).ConfigureAwait(false);
-                    if (remaining == 0) return;
-                }
-            }
-        }
-
         private const int DetailBlockRows = 128;
 
-        private List<DependentDetail> ReadAreaDetails(ExcelLocation area, ReferenceArea parsed, int startRow, int endRow,
-            Dictionary<string, object> workbookCache)
+        // Ctrl+Shift+Q: a direct clone of Excel's built-in "Trace Dependents".
+        // Runs synchronously on Excel's thread inside the command (macro context),
+        // exactly like a VBA macro would: ShowDependents, then NavigateArrow over
+        // every arrow and link, reading the target from the selection, then the
+        // arrows are removed and the Excel state is restored. The formulas and
+        // values of the found cells are read in batched blocks before the window
+        // opens, so the window shows the complete list at once. The workbook is
+        // never scanned and the reverse index is not used.
+        public DependencyResult TraceDependents(ExcelLocation location)
         {
+            if (location == null) throw new ArgumentNullException(nameof(location));
             EnsureExcelThread();
-            var batch = new List<DependentDetail>();
+            var total = Stopwatch.StartNew();
+            var host = new ExcelNativeTraceHost(this, location);
+            Interlocked.Increment(ref _nativeTraceActive);
+            NativeTraceAttempt attempt;
             try
             {
-                dynamic workbook;
-                object cached;
-                if (workbookCache.TryGetValue(area.Workbook, out cached))
+                // Every host method runs inline and returns a completed task, so the
+                // shared enumerator completes synchronously without a thread switch.
+                attempt = NativeDependentTrace.RunAsync(host, location.Workbook, location.Sheet, CancellationToken.None)
+                    .GetAwaiter().GetResult();
+            }
+            catch (Exception error)
+            {
+                Interlocked.Decrement(ref _nativeTraceActive);
+                return new DependencyResult(new List<DependentCell>().AsReadOnly(),
+                    new List<string> { "Штатная трассировка Excel прервана ошибкой: " + ComMessage(error) }.AsReadOnly(),
+                    0, false, total.ElapsedMilliseconds, true, total.ElapsedMilliseconds, null);
+            }
+            Interlocked.Decrement(ref _nativeTraceActive);
+            long traceMilliseconds = total.ElapsedMilliseconds;
+
+            var warnings = new List<string>();
+            if (attempt.Status != NativeTraceStatus.Succeeded)
+                warnings.Add(NativeDependentTrace.Decide(attempt).Warning);
+            IReadOnlyList<NativeTraceArea> merged = NativeDependentTrace.MergeAreas(attempt.Areas);
+            IReadOnlyList<NativeTraceCell> expanded;
+            if (!NativeDependentTrace.TryExpandCells(merged, NativeDependentTrace.MaxCells, out expanded))
+                warnings.Add("Результат усечён до " + NativeDependentTrace.MaxCells
+                    + " ячеек: штатная трассировка вернула слишком большой диапазон.");
+
+            var cells = ReadDependentCells(merged);
+            total.Stop();
+            return new DependencyResult(cells.AsReadOnly(), warnings.AsReadOnly(), cells.Count, false,
+                total.ElapsedMilliseconds, true, traceMilliseconds, null);
+        }
+
+        // Reads formulas and values area by area in blocks of 128 rows: one
+        // Formula2 and one Value2 call per block. A failed block is reported per
+        // cell with the actual reason.
+        private List<DependentCell> ReadDependentCells(IReadOnlyList<NativeTraceArea> areas)
+        {
+            var cells = new List<DependentCell>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var workbooks = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            int remaining = NativeDependentTrace.MaxCells;
+            foreach (NativeTraceArea area in areas)
+            {
+                ReferenceArea parsed;
+                if (!ReferenceParser.TryParse(area.Address, area.Workbook, area.Sheet, out parsed)) continue;
+                int width = parsed.EndColumn - parsed.StartColumn + 1;
+                for (int startRow = parsed.StartRow; startRow <= parsed.EndRow && remaining > 0; startRow += DetailBlockRows)
                 {
-                    workbook = (dynamic)cached;
+                    int endRow = Math.Min(startRow + DetailBlockRows - 1, parsed.EndRow);
+                    endRow = Math.Min(endRow, startRow + Math.Max(remaining / width, 1) - 1);
+                    ReadBlock(area, parsed, startRow, endRow, workbooks, seen, cells);
+                    remaining = NativeDependentTrace.MaxCells - cells.Count;
                 }
+                if (remaining <= 0) break;
+            }
+            return cells;
+        }
+
+        private void ReadBlock(NativeTraceArea area, ReferenceArea parsed, int startRow, int endRow,
+            Dictionary<string, object> workbooks, HashSet<string> seen, List<DependentCell> cells)
+        {
+            object formulas = null;
+            object values = null;
+            string failure = null;
+            try
+            {
+                object cached;
+                dynamic workbook;
+                if (workbooks.TryGetValue(area.Workbook, out cached)) workbook = cached;
                 else
                 {
                     workbook = FindOpenWorkbook(area.Workbook);
-                    workbookCache[area.Workbook] = workbook;
+                    workbooks[area.Workbook] = workbook;
                 }
                 if (workbook == null) throw new InvalidOperationException("книга не открыта");
                 dynamic sheet = workbook.Worksheets[area.Sheet];
-                string blockAddress = ColumnName(parsed.StartColumn) + startRow.ToString(CultureInfo.InvariantCulture)
+                string address = ColumnName(parsed.StartColumn) + startRow.ToString(CultureInfo.InvariantCulture)
                     + ":" + ColumnName(parsed.EndColumn) + endRow.ToString(CultureInfo.InvariantCulture);
-                dynamic range = sheet.Range[blockAddress];
-                object formulas = ReadFormulas(range);
-                object values;
+                dynamic range = sheet.Range[address];
+                formulas = ReadFormulas(range);
                 try { values = range.Value2; }
                 catch (Exception) { values = null; }
-                for (int row = startRow; row <= endRow; row++)
-                {
-                    for (int column = parsed.StartColumn; column <= parsed.EndColumn; column++)
-                    {
-                        string address = ColumnName(column) + row.ToString(CultureInfo.InvariantCulture);
-                        var cellLocation = new ExcelLocation(area.Workbook, area.Sheet, address);
-                        string formula = Convert.ToString(ArrayCell(formulas, row - startRow, column - parsed.StartColumn),
-                            CultureInfo.InvariantCulture) ?? String.Empty;
-                        object value = ArrayCell(values, row - startRow, column - parsed.StartColumn);
-                        batch.Add(new DependentDetail(cellLocation, formula, DisplayValue(value)));
-                    }
-                }
             }
-            catch (Exception error)
+            catch (Exception error) { failure = "не прочитано: " + ComMessage(error); }
+
+            for (int row = startRow; row <= endRow; row++)
             {
-                // The reason is reported per cell as it happened; nothing is guessed.
-                for (int row = startRow; row <= endRow; row++)
+                for (int column = parsed.StartColumn; column <= parsed.EndColumn; column++)
                 {
-                    for (int column = parsed.StartColumn; column <= parsed.EndColumn; column++)
+                    string address = ColumnName(column) + row.ToString(CultureInfo.InvariantCulture);
+                    var location = new ExcelLocation(area.Workbook, area.Sheet, address);
+                    if (!seen.Add(location.Key)) continue;
+                    if (failure != null)
                     {
-                        string address = ColumnName(column) + row.ToString(CultureInfo.InvariantCulture);
-                        batch.Add(new DependentDetail(new ExcelLocation(area.Workbook, area.Sheet, address),
-                            "не прочитано: " + ComMessage(error), String.Empty));
+                        cells.Add(new DependentCell(new InspectionContext(location, String.Empty, String.Empty, false), failure));
+                        continue;
                     }
+                    string formula = Convert.ToString(ArrayCell(formulas, row - startRow, column - parsed.StartColumn),
+                        CultureInfo.InvariantCulture) ?? String.Empty;
+                    object value = ArrayCell(values, row - startRow, column - parsed.StartColumn);
+                    cells.Add(new DependentCell(new InspectionContext(location, formula, DisplayValue(value), IsFormula(formula)),
+                        String.Empty));
                 }
             }
-            return batch;
         }
 
         // Excel returns either a scalar (single-cell range) or a 1-based 2D array.
@@ -186,87 +141,49 @@ namespace FormulaNavigator.AddIn.Excel
             Array array = values as Array;
             if (array == null) return values;
             if (array.Rank != 2) return null;
-            int row = Math.Min(rowOffset + array.GetLowerBound(0), array.GetUpperBound(0));
-            int column = Math.Min(columnOffset + array.GetLowerBound(1), array.GetUpperBound(1));
+            int row = rowOffset + array.GetLowerBound(0);
+            int column = columnOffset + array.GetLowerBound(1);
+            if (row > array.GetUpperBound(0) || column > array.GetUpperBound(1)) return null;
             return array.GetValue(row, column);
         }
 
-        // All tracer work runs on Excel's STA thread through the dispatcher. The
-        // source sheet is activated once before the arrows are created; before a
-        // navigation it is reactivated only when the previous navigation moved the
-        // selection off the source sheet, which keeps cross-sheet enumeration
-        // working without a fixed Activate/Select on every arrow.
+        // All work runs inline on Excel's thread. Every method returns a completed
+        // task. NavigateArrow moves the selection to its target; the target is read
+        // from Application.Selection, and a selection that stayed on the source
+        // cell is the end of the arrow or link.
         private sealed class ExcelNativeTraceHost : INativeTraceHost
         {
             private readonly ExcelGateway _gateway;
             private readonly ExcelLocation _source;
+            private readonly string _sourceKey;
             private readonly StateRestoreStack _restore = new StateRestoreStack();
             private readonly List<string> _cleanupFailures = new List<string>();
             private dynamic _workbook;
             private dynamic _sheet;
             private dynamic _sourceRange;
-            private dynamic _originalWorkbook;
-            private dynamic _originalSheet;
-            private dynamic _originalSelection;
-            private dynamic _originalActiveCell;
-            private bool _screenUpdating;
-            private bool _enableEvents;
-            private bool _displayAlerts;
-            private bool _activated;
-            private bool _leftSourceSheet;
+            private bool _offSourceSheet;
             private string _lastFailure;
 
             public ExcelNativeTraceHost(ExcelGateway gateway, ExcelLocation source)
             {
                 _gateway = gateway;
                 _source = source;
+                _sourceKey = Key(source.Workbook, source.Sheet, source.Address);
             }
 
             public IReadOnlyList<string> CleanupFailures { get { return _cleanupFailures.AsReadOnly(); } }
             public string LastFailure { get { return _lastFailure; } }
 
-            public Task<bool> TrySaveStateAsync()
-            {
-                return _gateway.OnExcelThread(() => SaveState());
-            }
-
-            public Task<UserArrowCheck> CheckUserArrowsAsync()
-            {
-                return _gateway.OnExcelThread(() => CheckUserArrows());
-            }
-
-            public Task<bool> TryCreateArrowsAsync()
-            {
-                return _gateway.OnExcelThread(() => CreateArrows());
-            }
-
+            public Task<bool> TrySaveStateAsync() { return Task.FromResult(SaveState()); }
+            public Task<UserArrowCheck> CheckUserArrowsAsync() { return Task.FromResult(CheckUserArrows()); }
+            public Task<bool> TryCreateArrowsAsync() { return Task.FromResult(CreateArrows()); }
             public Task<NativeArrowStep> NavigateAsync(int arrowNumber, int? linkNumber)
             {
-                return _gateway.OnExcelThread(() => NavigateStep(arrowNumber, linkNumber));
+                return Task.FromResult(Navigate(arrowNumber, linkNumber ?? 1));
             }
-
-            public Task RemoveCreatedArrowsAsync()
-            {
-                return _gateway.OnExcelThread(delegate
-                {
-                    RemoveCreatedArrows();
-                    return true;
-                });
-            }
-
-            public Task RestoreStateAsync()
-            {
-                return _gateway.OnExcelThread(delegate
-                {
-                    RestoreState();
-                    return true;
-                });
-            }
-
-            public void RecordCleanupFailure(string message)
-            {
-                _cleanupFailures.Add(message);
-            }
+            public Task RemoveCreatedArrowsAsync() { RemoveCreatedArrows(); return Task.FromResult(true); }
+            public Task RestoreStateAsync() { RestoreState(); return Task.FromResult(true); }
+            public void RecordCleanupFailure(string message) { _cleanupFailures.Add(message); }
 
             private bool Fail(string message)
             {
@@ -274,188 +191,168 @@ namespace FormulaNavigator.AddIn.Excel
                 return false;
             }
 
-            // Reads the complete state snapshot before anything is modified. A
-            // failure here aborts the native path without changing Excel at all.
             private bool SaveState()
             {
                 dynamic application = _gateway._application;
-                try { _originalWorkbook = application.ActiveWorkbook; }
-                catch (Exception error) { return Fail("не удалось сохранить активную книгу: " + ComMessage(error)); }
-                try { _originalSheet = application.ActiveSheet; }
-                catch (Exception error) { return Fail("не удалось сохранить активный лист: " + ComMessage(error)); }
-                try { _originalSelection = application.Selection; }
-                catch (Exception error) { return Fail("не удалось сохранить выделение: " + ComMessage(error)); }
-                try { _originalActiveCell = application.ActiveCell; }
-                catch (Exception error) { return Fail("не удалось сохранить активную ячейку: " + ComMessage(error)); }
-                try { _screenUpdating = Convert.ToBoolean(application.ScreenUpdating, CultureInfo.InvariantCulture); }
-                catch (Exception error) { return Fail("не удалось сохранить настройку обновления экрана: " + ComMessage(error)); }
-                try { _enableEvents = Convert.ToBoolean(application.EnableEvents, CultureInfo.InvariantCulture); }
-                catch (Exception error) { return Fail("не удалось сохранить настройку событий: " + ComMessage(error)); }
-                try { _displayAlerts = Convert.ToBoolean(application.DisplayAlerts, CultureInfo.InvariantCulture); }
-                catch (Exception error) { return Fail("не удалось сохранить настройку предупреждений: " + ComMessage(error)); }
+                dynamic originalWorkbook, originalSheet, originalSelection, originalActiveCell;
+                bool screenUpdating, enableEvents, displayAlerts;
+                try
+                {
+                    originalWorkbook = application.ActiveWorkbook;
+                    originalSheet = application.ActiveSheet;
+                    originalSelection = application.Selection;
+                    originalActiveCell = application.ActiveCell;
+                    screenUpdating = Convert.ToBoolean(application.ScreenUpdating, CultureInfo.InvariantCulture);
+                    enableEvents = Convert.ToBoolean(application.EnableEvents, CultureInfo.InvariantCulture);
+                    displayAlerts = Convert.ToBoolean(application.DisplayAlerts, CultureInfo.InvariantCulture);
+                }
+                catch (Exception error) { return Fail("не удалось сохранить состояние Excel: " + ComMessage(error)); }
                 try
                 {
                     _workbook = _gateway.FindOpenWorkbook(_source.Workbook);
+                    if (_workbook == null) return Fail("книга '" + _source.Workbook + "' не открыта");
                     _sheet = _workbook.Worksheets[_source.Sheet];
                     _sourceRange = _sheet.Range[_source.Address].Cells[1, 1];
                 }
                 catch (Exception error) { return Fail("не удалось найти исходную ячейку: " + ComMessage(error)); }
 
-                // The stack executes in reverse order, which produces the actual
-                // restore sequence: source workbook, source sheet, selection,
-                // active cell, then the application settings. Application events
-                // are re-enabled only after the navigation state is back.
-                _restore.Push("обновление экрана", delegate { application.ScreenUpdating = _screenUpdating; });
-                _restore.Push("события", delegate { application.EnableEvents = _enableEvents; });
-                _restore.Push("предупреждения", delegate { application.DisplayAlerts = _displayAlerts; });
-                if (_originalActiveCell != null)
-                    _restore.Push("активная ячейка", delegate { _originalActiveCell.Activate(); });
-                if (_originalSelection != null)
-                    _restore.Push("выделение", delegate { _originalSelection.Select(); });
-                if (_originalSheet != null)
-                    _restore.Push("активный лист", delegate { _originalSheet.Activate(); });
-                if (_originalWorkbook != null)
-                    _restore.Push("активная книга", delegate { _originalWorkbook.Activate(); });
+                // Executed in reverse: workbook, sheet, selection, active cell, then
+                // the application settings.
+                _restore.Push("обновление экрана", delegate { application.ScreenUpdating = screenUpdating; });
+                _restore.Push("события", delegate { application.EnableEvents = enableEvents; });
+                _restore.Push("предупреждения", delegate { application.DisplayAlerts = displayAlerts; });
+                if (originalActiveCell != null) _restore.Push("активная ячейка", delegate { originalActiveCell.Activate(); });
+                if (originalSelection != null) _restore.Push("выделение", delegate { originalSelection.Select(); });
+                if (originalSheet != null) _restore.Push("активный лист", delegate { originalSheet.Activate(); });
+                if (originalWorkbook != null) _restore.Push("активная книга", delegate { originalWorkbook.Activate(); });
+
                 return true;
             }
 
-            // Preparation (activation and selection) is separate from the probe
-            // itself: a failed preparation means the safety of changing arrows
-            // cannot be established, and nothing is touched. A failed probe is the
-            // documented "no visible tracer arrows" condition of NavigateArrow.
+            // Existing arrows of the source cell: following arrow 1 moves the
+            // selection away. Without arrows the selection stays or Excel raises
+            // an error. Either way the selection is returned to the source.
             private UserArrowCheck CheckUserArrows()
             {
-                if (!Prepare()) return UserArrowCheck.CheckFailed;
                 try
                 {
-                    _sourceRange.NavigateArrow(false, 1);
-                    return UserArrowCheck.Exists;
+                    dynamic application = _gateway._application;
+                    application.ScreenUpdating = false;
+                    application.EnableEvents = false;
+                    application.DisplayAlerts = false;
                 }
                 catch (Exception error)
                 {
-                    _lastFailure = ComMessage(error);
-                    return UserArrowCheck.NoArrows;
+                    Fail("не удалось отключить обновление экрана: " + ComMessage(error));
+                    return UserArrowCheck.CheckFailed;
                 }
+                if (!GoToSource(true)) return UserArrowCheck.CheckFailed;
+                NativeArrowStep probe = Navigate(1, 1);
+                if (!GoToSource(true)) return UserArrowCheck.CheckFailed;
+                return probe.Captured ? UserArrowCheck.Exists : UserArrowCheck.NoArrows;
             }
 
             private bool CreateArrows()
             {
-                if (!Prepare()) return false;
-                dynamic application = _gateway._application;
+                if (!GoToSource(true)) return false;
                 try
                 {
-                    application.ScreenUpdating = false;
-                    application.EnableEvents = false;
-                    application.DisplayAlerts = false;
                     _sourceRange.ShowDependents(false);
                     return true;
                 }
-                catch (Exception error)
-                {
-                    return Fail("Excel не построил стрелки зависимых: " + ComMessage(error));
-                }
+                catch (Exception error) { return Fail("Excel не построил стрелки зависимых: " + ComMessage(error)); }
             }
 
-            private NativeArrowStep NavigateStep(int arrowNumber, int? linkNumber)
+            private NativeArrowStep Navigate(int arrowNumber, int linkNumber)
             {
+                // NavigateArrow works relative to the selected source cell, as in
+                // the built-in command. Selecting a cell with screen updating off
+                // is cheap; the sheet is reactivated only after leaving it.
+                if (!GoToSource(_offSourceSheet)) return NativeArrowStep.FailedStep(_lastFailure);
                 try
                 {
-                    // Reactivate the source sheet only after a navigation moved the
-                    // selection to another sheet; same-sheet navigation does not
-                    // require a fixed Activate/Select on every arrow.
-                    if (_leftSourceSheet)
-                    {
-                        if (!Prepare()) return NativeArrowStep.FailedStep(_lastFailure);
-                        _leftSourceSheet = false;
-                    }
-                    dynamic target = linkNumber.HasValue
-                        ? _sourceRange.NavigateArrow(false, arrowNumber, linkNumber.Value)
-                        : _sourceRange.NavigateArrow(false, arrowNumber);
-                    List<NativeTraceArea> areas = CaptureAreas(target);
-                    string sourceKey = _source.Workbook + "|" + _source.Sheet + "|"
-                        + NativeDependentTrace.NormalizeAddress(_source.Address);
-                    List<NativeTraceArea> filtered = areas.Where(area =>
-                        !String.Equals(NativeDependentTrace.AreaKey(area), sourceKey, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    if (filtered.Count == 0) return NativeArrowStep.FailedStep("навигация не покинула исходную ячейку");
-                    _leftSourceSheet = filtered.Any(area =>
-                        !String.Equals(area.Sheet, _source.Sheet, StringComparison.OrdinalIgnoreCase) ||
-                        !String.Equals(area.Workbook, _source.Workbook, StringComparison.OrdinalIgnoreCase));
-                    return NativeArrowStep.CapturedStep(filtered);
+                    _sourceRange.NavigateArrow(false, arrowNumber, linkNumber);
                 }
                 catch (Exception error)
                 {
-                    // After a failed navigation the selection state is unknown, so the
-                    // next step re-prepares the source sheet.
-                    _leftSourceSheet = true;
-                    return NativeArrowStep.FailedStep(ComMessage(error));
+                    _offSourceSheet = true;
+                    _lastFailure = ComMessage(error);
+                    return NativeArrowStep.FailedStep(_lastFailure);
+                }
+                try
+                {
+                    dynamic selection = _gateway._application.Selection;
+                    List<NativeTraceArea> areas = CaptureAreas(selection);
+                    if (areas.Count == 0) return NativeArrowStep.EndStep();
+                    _offSourceSheet = areas.Any(area =>
+                        !String.Equals(area.Sheet, _source.Sheet, StringComparison.OrdinalIgnoreCase) ||
+                        !String.Equals(area.Workbook, _source.Workbook, StringComparison.OrdinalIgnoreCase));
+                    bool stayed = areas.Count == 1 && String.Equals(Key(areas[0].Workbook, areas[0].Sheet, areas[0].Address),
+                        _sourceKey, StringComparison.OrdinalIgnoreCase);
+                    return stayed ? NativeArrowStep.EndStep() : NativeArrowStep.CapturedStep(areas);
+                }
+                catch (Exception error)
+                {
+                    _offSourceSheet = true;
+                    _lastFailure = "не удалось прочитать цель стрелки: " + ComMessage(error);
+                    return NativeArrowStep.FailedStep(_lastFailure);
                 }
             }
 
-            // ShowDependents(true) removes only the dependent arrows of this cell;
-            // user precedent arrows are not affected and user dependent arrows
-            // were excluded by the check before any arrow was created.
             private void RemoveCreatedArrows()
             {
                 try
                 {
-                    if (!_activated) Prepare();
+                    GoToSource(_offSourceSheet);
                     _sourceRange.ShowDependents(true);
                 }
-                catch (Exception error)
-                {
-                    RecordCleanupFailure("не удалены созданные стрелки: " + ComMessage(error));
-                }
+                catch (Exception error) { RecordCleanupFailure("не удалены созданные стрелки: " + ComMessage(error)); }
             }
 
             private void RestoreState()
             {
-                try { _restore.RestoreAll(); }
-                catch (Exception error) { RecordCleanupFailure("не восстановлено состояние: " + ComMessage(error)); }
+                _restore.RestoreAll();
                 _cleanupFailures.AddRange(_restore.Failures);
             }
 
-            private bool Prepare()
+            private bool GoToSource(bool activate)
             {
                 try
                 {
-                    _workbook.Activate();
-                    _sheet.Activate();
+                    if (activate)
+                    {
+                        _workbook.Activate();
+                        _sheet.Activate();
+                        _offSourceSheet = false;
+                    }
                     _sourceRange.Select();
-                    _activated = true;
                     return true;
                 }
-                catch (Exception error)
-                {
-                    return Fail("не удалось активировать исходный лист: " + ComMessage(error));
-                }
+                catch (Exception error) { return Fail("не удалось выделить исходную ячейку: " + ComMessage(error)); }
             }
 
-            private List<NativeTraceArea> CaptureAreas(dynamic target)
+            private static List<NativeTraceArea> CaptureAreas(dynamic range)
             {
                 var areas = new List<NativeTraceArea>();
-                if (target == null) return areas;
-                try
+                if (range == null) return areas;
+                dynamic parts = range.Areas;
+                int count = Convert.ToInt32(parts.Count, CultureInfo.InvariantCulture);
+                for (int index = 1; index <= count; index++)
                 {
-                    dynamic parts = target.Areas;
-                    int count = Convert.ToInt32(parts.Count, CultureInfo.InvariantCulture);
-                    for (int index = 1; index <= count; index++) CaptureSingleArea(areas, parts[index]);
-                }
-                catch (Exception)
-                {
-                    CaptureSingleArea(areas, target);
+                    dynamic part = parts[index];
+                    dynamic sheet = part.Worksheet;
+                    dynamic workbook = sheet.Parent;
+                    areas.Add(new NativeTraceArea(
+                        Convert.ToString(workbook.Name, CultureInfo.InvariantCulture),
+                        Convert.ToString(sheet.Name, CultureInfo.InvariantCulture),
+                        NativeDependentTrace.NormalizeAddress(Convert.ToString(part.Address, CultureInfo.InvariantCulture))));
                 }
                 return areas;
             }
 
-            private static void CaptureSingleArea(List<NativeTraceArea> areas, dynamic range)
+            private static string Key(string workbook, string sheet, string address)
             {
-                dynamic sheet = range.Worksheet;
-                dynamic workbook = sheet.Parent;
-                areas.Add(new NativeTraceArea(
-                    Convert.ToString(workbook.Name, CultureInfo.InvariantCulture),
-                    Convert.ToString(sheet.Name, CultureInfo.InvariantCulture),
-                    Convert.ToString(range.Address, CultureInfo.InvariantCulture)));
+                return workbook + "|" + sheet + "|" + NativeDependentTrace.NormalizeAddress(address);
             }
         }
     }

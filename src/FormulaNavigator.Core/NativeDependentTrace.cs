@@ -98,14 +98,16 @@ namespace FormulaNavigator.Core
         }
     }
 
-    // Outcome of one NavigateArrow call. The COM adapter cannot distinguish the
-    // documented "no visible tracer arrows" error from any other failure, so it
-    // reports only Captured/Failed and the enumerator classifies the failure.
+    // Outcome of one NavigateArrow call. NavigateArrow moves the selection to the
+    // target; when the requested arrow or link does not exist, the selection
+    // stays on the source cell. This is the canonical end of enumeration used by
+    // the classic "list dependents" macros. An exception is a separate failure.
     public sealed class NativeArrowStep
     {
         private NativeArrowStep() { }
 
         public bool Captured { get; private set; }
+        public bool Ended { get; private set; }
         public IReadOnlyList<NativeTraceArea> Areas { get; private set; }
         public string Failure { get; private set; }
 
@@ -114,9 +116,15 @@ namespace FormulaNavigator.Core
             return new NativeArrowStep { Captured = true, Areas = areas ?? new List<NativeTraceArea>().AsReadOnly() };
         }
 
+        // The selection stayed on the source cell: no such arrow or link.
+        public static NativeArrowStep EndStep()
+        {
+            return new NativeArrowStep { Ended = true, Areas = new List<NativeTraceArea>().AsReadOnly() };
+        }
+
         public static NativeArrowStep FailedStep(string failure)
         {
-            return new NativeArrowStep { Captured = false, Failure = failure };
+            return new NativeArrowStep { Failure = failure, Areas = new List<NativeTraceArea>().AsReadOnly() };
         }
     }
 
@@ -257,56 +265,55 @@ namespace FormulaNavigator.Core
             return attempt;
         }
 
+        // Classic enumeration: for every arrow, links 1..n are followed until the
+        // selection stays on the source cell. Arrow 1 / link 1 staying on the
+        // source means the cell has no dependents. Same-sheet arrows end at link 2;
+        // the off-sheet arrow lists every other sheet and workbook through its
+        // links. A repeated target also ends the link loop, so a host that echoes
+        // the last link instead of staying on the source cannot loop.
         private static async Task<NativeTraceStatus> EnumerateAsync(INativeTraceHost host, string sourceWorkbook,
             string sourceSheet, NativeTraceAttempt attempt, CancellationToken cancellation)
         {
             for (int arrow = 1; arrow <= MaxArrows; arrow++)
             {
                 cancellation.ThrowIfCancellationRequested();
-                NativeArrowStep step = await host.NavigateAsync(arrow, null).ConfigureAwait(false);
-                if (!step.Captured)
-                {
-                    if (arrow == 1) return NativeTraceStatus.FirstArrowFailed;
-                    // Confirm the trace is still healthy: the previous arrow must
-                    // still navigate. If it does, a repeated failure of the current
-                    // arrow is the documented "no such arrow" condition. This does
-                    // not prove that a later arrow does not exist: the failure of an
-                    // existing arrow is indistinguishable from its absence, so the
-                    // completeness of the result stays unconfirmed.
-                    NativeArrowStep recheck = await host.NavigateAsync(arrow - 1, null).ConfigureAwait(false);
-                    if (!recheck.Captured) return NativeTraceStatus.EnumerationFailed;
-                    NativeArrowStep retry = await host.NavigateAsync(arrow, null).ConfigureAwait(false);
-                    if (!retry.Captured) break;
-                    step = retry;
-                }
-                attempt.AddAreas(step.Areas);
-                if (arrow == MaxArrows) return NativeTraceStatus.LimitReached;
-                // Excel combines every target that leaves the source sheet — other
-                // sheets of the same workbook as well as other workbooks, even when
-                // the target sheet carries the same name — into a single off-sheet
-                // arrow and enumerates the individual targets through LinkNumber.
-                // Same-sheet targets get their own arrows.
-                bool offSheet = step.Areas.Any(area =>
-                    !String.Equals(area.Sheet, sourceSheet, StringComparison.OrdinalIgnoreCase) ||
-                    !String.Equals(area.Workbook, sourceWorkbook, StringComparison.OrdinalIgnoreCase));
-                if (!offSheet) continue;
+                NativeArrowStep first = await NavigateWithRetryAsync(host, arrow, 1).ConfigureAwait(false);
+                if (first.Ended) return NativeTraceStatus.Succeeded;
+                // Excel may raise an error instead of keeping the selection for a
+                // missing arrow; after at least one arrow this is the end too. A
+                // failing first arrow cannot be told apart from a broken trace.
+                if (!first.Captured)
+                    return arrow == 1 ? NativeTraceStatus.FirstArrowFailed : NativeTraceStatus.Succeeded;
+                attempt.AddAreas(first.Areas);
+                string previous = StepKey(first);
                 for (int link = 2; link <= MaxLinks; link++)
                 {
                     cancellation.ThrowIfCancellationRequested();
-                    NativeArrowStep linkStep = await host.NavigateAsync(arrow, link).ConfigureAwait(false);
-                    if (!linkStep.Captured)
-                    {
-                        NativeArrowStep recheck = await host.NavigateAsync(arrow, link - 1).ConfigureAwait(false);
-                        if (!recheck.Captured) return NativeTraceStatus.EnumerationFailed;
-                        NativeArrowStep retry = await host.NavigateAsync(arrow, link).ConfigureAwait(false);
-                        if (!retry.Captured) break;
-                        linkStep = retry;
-                    }
-                    attempt.AddAreas(linkStep.Areas);
+                    NativeArrowStep step = await host.NavigateAsync(arrow, link).ConfigureAwait(false);
+                    // For a same-sheet arrow a missing link may raise an error
+                    // instead of keeping the selection: both end the links.
+                    if (!step.Captured) break;
+                    string key = StepKey(step);
+                    if (String.Equals(key, previous, StringComparison.OrdinalIgnoreCase)) break;
+                    attempt.AddAreas(step.Areas);
+                    previous = key;
                     if (link == MaxLinks) return NativeTraceStatus.LimitReached;
                 }
+                if (arrow == MaxArrows) return NativeTraceStatus.LimitReached;
             }
             return NativeTraceStatus.Succeeded;
+        }
+
+        private static async Task<NativeArrowStep> NavigateWithRetryAsync(INativeTraceHost host, int arrow, int link)
+        {
+            NativeArrowStep step = await host.NavigateAsync(arrow, link).ConfigureAwait(false);
+            if (step.Captured || step.Ended) return step;
+            return await host.NavigateAsync(arrow, link).ConfigureAwait(false);
+        }
+
+        private static string StepKey(NativeArrowStep step)
+        {
+            return String.Join(";", step.Areas.Select(AreaKey).ToArray());
         }
 
         public static NativeTraceDecision Decide(NativeTraceAttempt attempt)

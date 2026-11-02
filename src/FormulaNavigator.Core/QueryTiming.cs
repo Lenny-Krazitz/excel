@@ -1,22 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 
 namespace FormulaNavigator.Core
 {
-    // Measures the stages of one Ctrl+Shift+Q request so the results window can
-    // show how long each part of the work took. The clock starts when the command
-    // handler begins, before the window is created or Excel is touched. The clock
-    // is injectable so the description is testable without a real timer.
+    // Stage timings of one Ctrl+Shift+Q request: the built-in trace, reading the
+    // formulas and values, and the total time from the key press until the window
+    // shows the list. The clock is injectable so the description is testable.
     public sealed class QueryTiming
     {
         private readonly Func<long> _elapsedMilliseconds;
-        private long _windowShown = -1;
-        private long _listReady = -1;
-        private long _detailsDone = -1;
-        private long _traceMilliseconds = -1;
-        private long _searchMilliseconds = -1;
+        private long _start;
+        private long _trace = -1;
+        private long _details = -1;
+        private long _ready = -1;
 
         public QueryTiming()
         {
@@ -28,62 +25,40 @@ namespace FormulaNavigator.Core
         {
             if (elapsedMilliseconds == null) throw new ArgumentNullException("elapsedMilliseconds");
             _elapsedMilliseconds = elapsedMilliseconds;
+            _start = elapsedMilliseconds();
         }
 
-        // Starts a new measurement for a repeated request in the same window. The
-        // window-shown mark belongs to the first request and is kept.
-        public void BeginSearch()
+        // Starts a repeated request (the Refresh button) from the current moment.
+        public void Restart()
         {
-            _listReady = -1;
-            _detailsDone = -1;
-            _traceMilliseconds = -1;
-            _searchMilliseconds = -1;
+            _start = _elapsedMilliseconds();
+            _trace = -1;
+            _details = -1;
+            _ready = -1;
         }
 
-        // Called when the window is first shown, before the search starts.
-        public void MarkWindowShown()
+        // Trace stage and total search time (trace plus formula reads), both
+        // measured by the gateway.
+        public void RecordSearch(long traceMilliseconds, long searchMilliseconds)
         {
-            if (_windowShown < 0) _windowShown = _elapsedMilliseconds();
+            if (traceMilliseconds >= 0) _trace = traceMilliseconds;
+            if (searchMilliseconds >= 0 && traceMilliseconds >= 0 && searchMilliseconds >= traceMilliseconds)
+                _details = searchMilliseconds - traceMilliseconds;
         }
 
-        // Called when the address list is built and rendered for the first time.
-        public void MarkListReady()
+        // The list is rendered and the window is usable.
+        public void MarkReady()
         {
-            if (_listReady < 0) _listReady = _elapsedMilliseconds();
-        }
-
-        // Called when the deferred formulas and values finished loading.
-        public void MarkDetailsDone()
-        {
-            if (_detailsDone < 0) _detailsDone = _elapsedMilliseconds();
-        }
-
-        // The tracer stage duration, measured by the gateway around the trace.
-        public void RecordTrace(long milliseconds)
-        {
-            if (milliseconds >= 0) _traceMilliseconds = milliseconds;
-        }
-
-        // The search stage duration (trace plus cleanup), measured by the gateway.
-        public void RecordSearch(long milliseconds)
-        {
-            if (milliseconds >= 0) _searchMilliseconds = milliseconds;
+            if (_ready < 0) _ready = _elapsedMilliseconds() - _start;
         }
 
         public string Describe()
         {
             var parts = new List<string>();
-            if (_windowShown >= 0) parts.Add("окно " + _windowShown + " мс");
-            if (_traceMilliseconds >= 0) parts.Add("трассировка " + _traceMilliseconds + " мс");
-            if (_listReady >= 0) parts.Add("список " + _listReady + " мс");
-            if (_detailsDone >= 0) parts.Add("детали " + _detailsDone + " мс");
+            if (_trace >= 0) parts.Add("трассировка " + _trace + " мс");
+            if (_details >= 0) parts.Add("формулы " + _details + " мс");
+            if (_ready >= 0) parts.Add("всего до окна " + _ready + " мс");
             return string.Join(" · ", parts.ToArray());
-        }
-
-        public string SearchSeconds()
-        {
-            if (_searchMilliseconds < 0) return "";
-            return (_searchMilliseconds / 1000.0).ToString("0.00", CultureInfo.InvariantCulture);
         }
     }
 }

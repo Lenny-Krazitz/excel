@@ -726,15 +726,14 @@ namespace FormulaNavigator.Core.Tests
 
         private static void NativeTraceEnumerationSequences()
         {
-            // Several arrows on one sheet: the failing third arrow is the documented
-            // end of enumeration because the second arrow still navigates and a
-            // repeated probe of the third fails again.
+            // Two same-sheet arrows: link 2 of each and arrow 3 stay on the source.
             var host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
+                if (link != 1) return NativeArrowStep.EndStep();
                 if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
                 if (arrow == 2) return Step(Area("Book.xlsx", "Sheet1", "C3"));
-                return NativeArrowStep.FailedStep("нет стрелки");
+                return NativeArrowStep.EndStep();
             };
             NativeTraceAttempt attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
             AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a complete enumeration must succeed");
@@ -742,112 +741,82 @@ namespace FormulaNavigator.Core.Tests
             Assert(host.RemoveArrowsCalled, "created arrows must be removed");
             Assert(host.RestoreCalled, "state must be restored");
 
-            // Off-sheet dependents — another sheet of the same workbook — are
-            // combined by Excel into a single arrow; the individual targets are
-            // enumerated through LinkNumber. The source sheet is Sheet1, so the
-            // Sheet2 target makes the arrow off-sheet and its links are probed.
+            // The off-sheet arrow lists other sheets and other workbooks through
+            // its links; every link is followed until the selection stays.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
-                if (arrow == 1 && !link.HasValue) return Step(Area("Book.xlsx", "Sheet2", "A1"));
-                if (arrow == 1 && link == 2) return Step(Area("Book.xlsx", "Sheet2", "B2"));
-                return NativeArrowStep.FailedStep("end");
+                if (arrow != 1) return NativeArrowStep.EndStep();
+                if (link == 1) return Step(Area("Book.xlsx", "Sheet2", "A1"));
+                if (link == 2) return Step(Area("Book.xlsx", "Sheet3", "B2:B4"));
+                if (link == 3) return Step(Area("Other.xlsx", "Sheet1", "A1"));
+                return NativeArrowStep.EndStep();
             };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "off-sheet targets must be enumerated through links");
-            AssertEqual(2, attempt.Areas.Count, "both off-sheet targets must be captured");
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "off-sheet links must be enumerated");
+            AssertEqual(3, attempt.Areas.Count, "every off-sheet target must be captured");
 
-            // Same-sheet targets keep their own arrows and never probe links: the
-            // fake host fails every link request, which would break enumeration.
+            // No dependents: arrow 1 / link 1 stays on the source cell.
+            host = new FakeTraceHost();
+            host.NavigateImpl = delegate { return NativeArrowStep.EndStep(); };
+            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a cell without dependents must succeed");
+            AssertEqual(0, attempt.Areas.Count, "no targets must be captured");
+
+            // A host that echoes the last link instead of staying cannot loop.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
-                if (link.HasValue) throw new InvalidOperationException("same-sheet arrows have no links");
-                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
-                return NativeArrowStep.FailedStep("end");
+                return arrow == 1 ? Step(Area("Book.xlsx", "Sheet1", "B2")) : NativeArrowStep.EndStep();
             };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "same-sheet arrows must not probe links");
-            AssertEqual(1, attempt.Areas.Count, "the same-sheet target must be captured");
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "an echoed link must end the links");
+            AssertEqual(1, attempt.Areas.Count, "an echoed link must not be captured twice");
 
-            // An external arrow: every link is enumerated and duplicates merge.
+            // An error on a later arrow is the end of the arrows, as in the
+            // classic macros; the captured arrows are kept.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
-                if (arrow == 1 && !link.HasValue) return Step(Area("Other.xlsx", "Sheet1", "A1"));
-                if (arrow == 1 && link == 2) return Step(Area("Book.xlsx", "Sheet1", "D4"), Area("Other.xlsx", "Sheet1", "$A$1"));
-                return NativeArrowStep.FailedStep("end");
+                if (arrow == 1 && link == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                if (arrow == 1) return NativeArrowStep.FailedStep("no link");
+                return NativeArrowStep.FailedStep("no arrow");
             };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "external links must be enumerated");
-            // The enumerator keeps raw captures; deduplication happens when the
-            // gateway merges the areas.
-            AssertEqual(3, attempt.Areas.Count, "every captured target must be recorded");
-            AssertEqual(2, NativeDependentTrace.MergeAreas(attempt.Areas).Count,
-                "duplicate external targets must be merged");
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a later error must end the arrows");
+            AssertEqual(1, attempt.Areas.Count, "the captured arrow must be kept");
 
-            // A transient failure of a later arrow is retried once and the
-            // enumeration continues with the same arrow.
+            // A transient error of the first arrow is retried once.
             host = new FakeTraceHost();
-            int arrow2Calls = 0;
+            int firstCalls = 0;
             host.NavigateImpl = delegate(int arrow, int? link)
             {
-                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
-                if (arrow == 2)
+                if (arrow == 1 && link == 1)
                 {
-                    arrow2Calls++;
-                    return arrow2Calls == 1
-                        ? NativeArrowStep.FailedStep("transient")
-                        : Step(Area("Book.xlsx", "Sheet1", "C3"));
+                    firstCalls++;
+                    return firstCalls == 1 ? NativeArrowStep.FailedStep("transient") : Step(Area("Book.xlsx", "Sheet1", "B2"));
                 }
-                return NativeArrowStep.FailedStep("end");
+                return NativeArrowStep.EndStep();
             };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a transient failure must be retried");
-            AssertEqual(2, attempt.Areas.Count, "both arrows must be captured after the retry");
+            AssertEqual(NativeTraceStatus.Succeeded, attempt.Status, "a transient first-arrow error must be retried");
+            AssertEqual(1, attempt.Areas.Count, "the retried arrow must be captured");
 
-            // A failing first arrow is inconclusive: no dependents and a COM error
-            // are indistinguishable, so the reverse index must be used.
+            // A first arrow that keeps failing is not reported as "no dependents".
             host = new FakeTraceHost();
             host.NavigateImpl = delegate { return NativeArrowStep.FailedStep("error"); };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.FirstArrowFailed, attempt.Status, "the first arrow failure is inconclusive");
-            AssertEqual(false, NativeDependentTrace.Decide(attempt).UseNative,
-                "an inconclusive trace must fall back to the index");
+            AssertEqual(NativeTraceStatus.FirstArrowFailed, attempt.Status, "a failing first arrow is inconclusive");
 
-            // A failing later arrow whose previous arrow no longer navigates means
-            // the trace is broken, not that enumeration ended.
-            host = new FakeTraceHost();
-            int arrow1Calls = 0;
-            host.NavigateImpl = delegate(int arrow, int? link)
-            {
-                if (arrow == 1)
-                {
-                    arrow1Calls++;
-                    return arrow1Calls == 1
-                        ? Step(Area("Book.xlsx", "Sheet1", "B2"))
-                        : NativeArrowStep.FailedStep("broken state");
-                }
-                return NativeArrowStep.FailedStep("error");
-            };
-            attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status,
-                "an unhealthy trace must not be reported as complete");
-            // A broken enumeration still keeps everything captured so far: the
-            // partial result is shown with a warning, never discarded.
-            AssertEqual(1, attempt.Areas.Count, "a partial result must be preserved after a failure");
-
-            // A host exception during enumeration is classified as a broken trace;
-            // the captured partial result survives and the cleanup still runs.
+            // A host exception keeps the partial result and still cleans up.
             host = new FakeTraceHost();
             host.NavigateImpl = delegate(int arrow, int? link)
             {
-                if (arrow == 1) return Step(Area("Book.xlsx", "Sheet1", "B2"));
+                if (arrow == 1) return link == 1 ? Step(Area("Book.xlsx", "Sheet1", "B2")) : NativeArrowStep.EndStep();
                 throw new InvalidOperationException("сбой COM");
             };
             attempt = NativeDependentTrace.RunAsync(host, "Book.xlsx", "Sheet1", CancellationToken.None).Result;
-            AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status,
-                "a host exception must not lose the partial result");
+            AssertEqual(NativeTraceStatus.EnumerationFailed, attempt.Status, "a host exception must be reported");
             AssertEqual(1, attempt.Areas.Count, "the captured target must survive a host exception");
             Assert(host.RemoveArrowsCalled, "created arrows must still be removed");
             Assert(host.RestoreCalled, "the state must still be restored");
@@ -943,45 +912,23 @@ namespace FormulaNavigator.Core.Tests
 
         private static void QueryTimingStages()
         {
-            // A fake clock makes the stage description deterministic: the window
-            // is shown at 40 ms, the trace takes 120 ms, the list is ready at
-            // 190 ms and the deferred details finish at 700 ms.
             long clock = 0;
             var timing = new QueryTiming(delegate { return clock; });
-            clock = 40;
-            timing.MarkWindowShown();
-            clock = 160;
-            timing.RecordTrace(120);
-            timing.RecordSearch(150);
+            timing.RecordSearch(120, 150);
             clock = 190;
-            timing.MarkListReady();
-            clock = 700;
-            timing.MarkDetailsDone();
-            AssertEqual("окно 40 мс · трассировка 120 мс · список 190 мс · детали 700 мс", timing.Describe(),
+            timing.MarkReady();
+            AssertEqual("трассировка 120 мс · формулы 30 мс · всего до окна 190 мс", timing.Describe(),
                 "every measured stage must be reported");
-            AssertEqual("0.15", timing.SearchSeconds(), "the search duration must be reported in seconds");
 
-            // Missing marks and negative measurements are omitted, so a partial
-            // timing never claims a stage it did not measure.
-            timing = new QueryTiming(delegate { return 10; });
-            timing.MarkWindowShown();
-            AssertEqual("окно 10 мс", timing.Describe(), "unmeasured stages must be omitted");
-            AssertEqual("", timing.SearchSeconds(), "an unmeasured search must not be reported");
-
-            // A repeated request in the same window restarts the stage marks but
-            // keeps the window-shown mark of the first request.
-            long repeated = 0;
-            timing = new QueryTiming(delegate { return repeated; });
-            repeated = 10;
-            timing.MarkWindowShown();
-            repeated = 25;
-            timing.MarkListReady();
-            timing.BeginSearch();
-            AssertEqual("окно 10 мс", timing.Describe(), "a repeated search must restart the stage marks");
-            repeated = 40;
-            timing.MarkListReady();
-            AssertEqual("окно 10 мс · список 40 мс", timing.Describe(),
-                "a repeated search must measure its own stages");
+            // A repeated request measures from its own start.
+            clock = 1000;
+            timing.Restart();
+            AssertEqual("", timing.Describe(), "a restarted timing must not report old stages");
+            timing.RecordSearch(40, 40);
+            clock = 1060;
+            timing.MarkReady();
+            AssertEqual("трассировка 40 мс · формулы 0 мс · всего до окна 60 мс", timing.Describe(),
+                "a repeated request must measure its own stages");
         }
 
         private static void RestoreStackHostOrder()
