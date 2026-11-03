@@ -103,7 +103,8 @@ namespace FormulaNavigator.AddIn
         {
             if (application == null) application = ExcelDnaUtil.Application;
             if (gateway == null) gateway = new ExcelGateway(application);
-            gateway.StartIndexing();
+            // Loading the add-in only registers commands. Workbook reads and
+            // native tracing belong to explicit user requests, never idle/save.
         }
 
         private static void RegisterKeys()
