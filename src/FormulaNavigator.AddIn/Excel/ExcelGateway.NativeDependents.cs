@@ -27,7 +27,6 @@ namespace FormulaNavigator.AddIn.Excel
             EnsureExcelThread();
             var total = Stopwatch.StartNew();
             var host = new ExcelNativeTraceHost(this, location);
-            Interlocked.Increment(ref _nativeTraceActive);
             NativeTraceAttempt attempt;
             try
             {
@@ -38,12 +37,10 @@ namespace FormulaNavigator.AddIn.Excel
             }
             catch (Exception error)
             {
-                Interlocked.Decrement(ref _nativeTraceActive);
                 return new DependencyResult(new List<DependentCell>().AsReadOnly(),
                     new List<string> { "Штатная трассировка Excel прервана ошибкой: " + ComMessage(error) }.AsReadOnly(),
                     0, false, total.ElapsedMilliseconds, true, total.ElapsedMilliseconds, null);
             }
-            Interlocked.Decrement(ref _nativeTraceActive);
             long traceMilliseconds = total.ElapsedMilliseconds;
 
             var warnings = new List<string>();

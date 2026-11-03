@@ -5,21 +5,19 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Threading;
 using FormulaNavigator.Core;
 
 namespace FormulaNavigator.AddIn.Excel
 {
-    // All methods which touch a COM object run through the Dispatcher captured on Excel's STA.
-    // Only immutable formula snapshots and range indexes are processed on worker threads.
+    // All Excel COM work runs synchronously on the creating Excel STA, on demand.
+    // No timers, workbook event sinks, workbook-wide caches or background workers.
     public sealed partial class ExcelGateway : IDisposable
     {
-        private const int XlCellTypeFormulas = -4123;
-        private const int MaxCellsPerRead = 4096;
         private readonly dynamic _application;
         private readonly Dispatcher _excelDispatcher;
         private readonly int _excelThreadId;
+        private bool _disposed;
 
         public ExcelGateway(object excelApplication)
         {
@@ -29,6 +27,14 @@ namespace FormulaNavigator.AddIn.Excel
             _application = excelApplication;
             _excelThreadId = Thread.CurrentThread.ManagedThreadId;
             _excelDispatcher = Dispatcher.CurrentDispatcher;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            EnsureExcelThread();
+            _disposed = true;
+            // No background tasks or Excel event subscriptions to tear down.
         }
 
         public InspectionContext CaptureActiveCell()
@@ -106,6 +112,7 @@ namespace FormulaNavigator.AddIn.Excel
 
         private void EnsureExcelThread()
         {
+            if (_disposed) throw new ObjectDisposedException(nameof(ExcelGateway));
             if (Thread.CurrentThread.ManagedThreadId != _excelThreadId || !_excelDispatcher.CheckAccess())
                 throw new InvalidOperationException("Excel COM must be accessed from the Excel STA thread that created ExcelGateway.");
         }
